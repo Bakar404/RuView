@@ -140,6 +140,20 @@ function Write-Fail {
     exit 1
 }
 
+# git writes ordinary progress ("From https://github.com/...") to stderr. Under
+# $ErrorActionPreference='Stop' Windows PowerShell 5.1 turns any native stderr
+# into a terminating RemoteException, so a perfectly successful fetch aborts the
+# script. Neither 2>$null nor 2>&1 suppresses that in 5.1 - the preference has
+# to be relaxed inside a scope, which is what this function exists to do.
+# Returns combined output; sets $script:GitExitCode for real failure checks.
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $ErrorActionPreference = 'Continue'
+    $out = & git @GitArgs 2>&1 | Out-String
+    $script:GitExitCode = $LASTEXITCODE
+    return $out
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
@@ -258,12 +272,15 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
         # script. Deepen it, otherwise switching branches fails with "did not
         # match any file(s) known to git" and pulling fails with "refusing to
         # merge unrelated histories".
-        if ((git rev-parse --is-shallow-repository 2>&1) -eq 'true') {
+        if ((Invoke-Git rev-parse --is-shallow-repository).Trim() -eq 'true') {
             Write-Info 'Existing checkout is shallow - converting it to a full clone...'
-            git fetch --unshallow 2>&1 | Out-String | Write-Info
+            Invoke-Git fetch --unshallow | Write-Info
         }
-        git remote set-branches origin '*' 2>&1 | Out-String | Write-Info
-        git fetch origin 2>&1 | Out-String | Write-Info
+        Invoke-Git remote set-branches origin '*' | Write-Info
+        Invoke-Git fetch origin | Write-Info
+        if ($script:GitExitCode -ne 0) {
+            Write-Warn 'git fetch reported a failure; continuing with the existing checkout.'
+        }
         Write-Ok "Existing checkout refreshed: $InstallDir"
         Write-Info 'Local edits preserved - not doing a hard reset.'
     } finally { Pop-Location }
@@ -275,8 +292,8 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
     # leaves the checkout unable to see other branches and unable to pull
     # without hitting unrelated-histories errors. The repo is small enough that
     # full history costs little and saves a lot of confusion later.
-    git clone $RepoUrl $InstallDir 2>&1 | Out-String | Write-Info
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Clone failed from $RepoUrl" 'Check the URL and your network/proxy settings.' }
+    Invoke-Git clone $RepoUrl $InstallDir | Write-Info
+    if ($script:GitExitCode -ne 0) { Write-Fail "Clone failed from $RepoUrl" 'Check the URL and your network/proxy settings.' }
     Write-Ok "Cloned to $InstallDir"
 }
 
