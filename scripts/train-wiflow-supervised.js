@@ -596,9 +596,20 @@ function loadPairedData(filePath) {
           }
         }
       } else if (obj.csi_shape && obj.csi_shape.length === 2) {
-        // Flat array with explicit shape: [dim, T]
-        csiDim = obj.csi_shape[0];
-        csiFlat = new Float32Array(csi);
+        const [rows, cols] = obj.csi_shape;
+        const timeMajor = obj.csi_layout === 'time_major' || rows === CONFIG.timeSteps;
+        if (timeMajor) {
+          csiDim = cols;
+          csiFlat = new Float32Array(csiDim * rows);
+          for (let t = 0; t < rows; t++) {
+            for (let d = 0; d < csiDim; d++) {
+              csiFlat[d * rows + t] = csi[t * csiDim + d] || 0;
+            }
+          }
+        } else {
+          csiDim = rows;
+          csiFlat = new Float32Array(csi);
+        }
       } else {
         csiDim = csi.length;
         csiFlat = new Float32Array(csi);
@@ -1393,7 +1404,10 @@ async function main() {
   console.log(`[4/6] Phase 2: Supervised keypoint regression (${supervisedEpochs} epochs, 4-stage curriculum)...`);
 
   const supervisedLog = { phase: 'supervised', epochs: [] };
-  const epochsPerStage = Math.floor(supervisedEpochs / CONFIG.curriculumStages.length);
+  const epochsPerStage = Math.max(
+    1,
+    Math.ceil(supervisedEpochs / CONFIG.curriculumStages.length)
+  );
 
   for (let epoch = 0; epoch < supervisedEpochs; epoch++) {
     // Determine curriculum stage

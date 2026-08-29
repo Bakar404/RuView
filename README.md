@@ -14,6 +14,13 @@
 >   avoids Docker Desktop's multi-source UDP loss on Windows.
 > - `scripts/windows/Flash-RuViewNode.ps1` flashes and provisions each board
 >   with unique node and TDM slot settings.
+> - `scripts/windows/Collect-RuViewTraining.ps1` synchronizes a Camo-connected
+>   iPhone camera with raw CSI from all three nodes, aligns the captures, and
+>   produces a paired dataset for supervised WiFlow training:
+>
+>   ```powershell
+>   .\scripts\windows\Collect-RuViewTraining.ps1 -Duration 1800 -Camera 0 -Preview
+>   ```
 > - The setup scripts handle PowerShell 5.1 native-command stderr safely and
 >   pre-pull the published image to avoid an accidental full Rust source build.
 >

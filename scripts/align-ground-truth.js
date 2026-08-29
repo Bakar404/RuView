@@ -529,6 +529,7 @@ function align() {
     paired.push({
       csi: csiMatrix.data,
       csi_shape: csiMatrix.shape,
+      csi_layout: 'time_major',
       kp: keypoints,
       conf: Math.round(avgConfidence * 1000) / 1000,
       n_camera_frames: matched.length,

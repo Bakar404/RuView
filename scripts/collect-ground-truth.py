@@ -185,6 +185,11 @@ def main():
         "(ADR-152 S2.1.3); adds room-frame keypoint rays + transceiver geometry "
         "to every record",
     )
+    parser.add_argument(
+        "--no-server-recording",
+        action="store_true",
+        help="Do not call the sensing-server recording API (use with a raw UDP recorder)",
+    )
     args = parser.parse_args()
 
     if not args.calibration:
@@ -257,15 +262,17 @@ def main():
     # --- Start CSI recording ---
     recording_url_start = f"{args.server}/api/v1/recording/start"
     recording_url_stop = f"{args.server}/api/v1/recording/stop"
-    csi_started = post_json(recording_url_start)
-    if csi_started:
-        print("CSI recording started on sensing server.")
-    else:
-        print(
-            "WARNING: Could not start CSI recording. "
-            "Camera keypoints will still be captured.",
-            file=sys.stderr,
-        )
+    csi_started = False
+    if not args.no_server_recording:
+        csi_started = post_json(recording_url_start)
+        if csi_started:
+            print("CSI recording started on sensing server.")
+        else:
+            print(
+                "WARNING: Could not start CSI recording. "
+                "Camera keypoints will still be captured.",
+                file=sys.stderr,
+            )
 
     # --- Graceful shutdown ---
     shutdown_requested = False

@@ -31,6 +31,8 @@ firmware/esp32-csi-node/test/*.obj
 # CSI recordings (local training/capture data — CSI is person data per
 # CLAUDE.md; never commit). Covers current and legacy layouts. See ADR-299.
 data/recordings/
+data/ground-truth/
+data/paired/
 v2/data/recordings/
 rust-port/wifi-densepose-rs/data/recordings/
 **/*.csi.jsonl

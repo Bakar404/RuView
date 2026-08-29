@@ -20,18 +20,25 @@ from datetime import datetime, timezone
 
 def parse_csi_packet(data):
     """Parse ADR-018 binary CSI packet into dict."""
-    if len(data) < 8:
+    if len(data) < 20:
         return None
 
-    # ADR-018 header: [magic(2), len(2), node_id(1), seq(1), rssi(1), channel(1), iq_data...]
-    # Simplified: extract what we can from the raw packet
-    node_id = data[4] if len(data) > 4 else 0
-    rssi = struct.unpack('b', bytes([data[6]]))[0] if len(data) > 6 else 0
-    channel = data[7] if len(data) > 7 else 0
+    magic, = struct.unpack_from("<I", data, 0)
+    if magic != 0xC5110001:
+        return None
 
-    # IQ data starts at offset 8
-    iq_data = data[8:] if len(data) > 8 else b''
-    n_subcarriers = len(iq_data) // 2  # I,Q pairs
+    node_id = data[4]
+    n_antennas = data[5]
+    n_subcarriers, = struct.unpack_from("<H", data, 6)
+    frequency_mhz, = struct.unpack_from("<I", data, 8)
+    sequence, = struct.unpack_from("<I", data, 12)
+    rssi = struct.unpack_from("<b", data, 16)[0]
+    noise_floor = struct.unpack_from("<b", data, 17)[0]
+
+    expected_iq_bytes = n_antennas * n_subcarriers * 2
+    if n_antennas == 0 or n_subcarriers == 0 or len(data) < 20 + expected_iq_bytes:
+        return None
+    iq_data = data[20:20 + expected_iq_bytes]
 
     # Compute amplitudes
     amplitudes = []
@@ -47,8 +54,11 @@ def parse_csi_packet(data):
         "ts_ns": time.time_ns(),
         "node_id": node_id,
         "rssi": rssi,
-        "channel": channel,
-        "subcarriers": n_subcarriers,
+        "noise_floor": noise_floor,
+        "frequency_mhz": frequency_mhz,
+        "seq": sequence,
+        "antennas": n_antennas,
+        "subcarriers": len(amplitudes),
         "amplitudes": amplitudes,
         "iq_hex": iq_data.hex(),
     }

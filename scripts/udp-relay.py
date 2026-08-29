@@ -30,7 +30,8 @@ import time
 
 
 def run_relay(listen_host: str, listen_port: int, forward_host: str,
-              forward_port: int, stats_interval: float, verbose: bool) -> int:
+              forward_port: int, tap_host: str | None, tap_port: int | None,
+              stats_interval: float, verbose: bool) -> int:
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
@@ -42,9 +43,12 @@ def run_relay(listen_host: str, listen_port: int, forward_host: str,
 
     tx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     forward_addr = (forward_host, forward_port)
+    tap_addr = (tap_host, tap_port) if tap_host and tap_port else None
 
     print(f"udp-relay: listening on {listen_host}:{listen_port} "
           f"-> forwarding to {forward_host}:{forward_port}")
+    if tap_addr:
+        print(f"udp-relay: training tap enabled at {tap_host}:{tap_port}")
     print("udp-relay: collapses multi-source UDP to a single loopback source "
           "so Docker Desktop on Windows forwards every packet (issue #374).")
 
@@ -56,6 +60,8 @@ def run_relay(listen_host: str, listen_port: int, forward_host: str,
         while True:
             data, src = rx.recvfrom(65535)
             tx.sendto(data, forward_addr)
+            if tap_addr:
+                tx.sendto(data, tap_addr)
             total += 1
             sources[src] = sources.get(src, 0) + 1
 
@@ -89,14 +95,22 @@ def main() -> int:
                    help="Where to forward packets (default: 127.0.0.1)")
     p.add_argument("--forward-port", type=int, default=5006,
                    help="Port Docker maps into the container (default: 5006)")
+    p.add_argument("--tap-host", default=None,
+                   help="Optional host receiving a duplicate training stream")
+    p.add_argument("--tap-port", type=int, default=None,
+                   help="Optional port receiving a duplicate training stream")
     p.add_argument("--stats-interval", type=float, default=10.0,
                    help="Seconds between stats lines (default: 10)")
     p.add_argument("--verbose", action="store_true",
                    help="Log every forwarded packet")
     args = p.parse_args()
 
+    if (args.tap_host is None) != (args.tap_port is None):
+        p.error("--tap-host and --tap-port must be supplied together")
+
     return run_relay(args.listen_host, args.listen_port, args.forward_host,
-                     args.forward_port, args.stats_interval, args.verbose)
+                     args.forward_port, args.tap_host, args.tap_port,
+                     args.stats_interval, args.verbose)
 
 
 if __name__ == "__main__":
