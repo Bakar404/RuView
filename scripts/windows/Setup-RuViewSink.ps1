@@ -146,12 +146,34 @@ function Write-Fail {
 # script. Neither 2>$null nor 2>&1 suppresses that in 5.1 - the preference has
 # to be relaxed inside a scope, which is what this function exists to do.
 # Returns combined output; sets $script:GitExitCode for real failure checks.
+# Same hazard, every other native tool. docker compose reports all of its
+# progress ("Container docker-sensing-server-1 Recreate") on stderr, so a
+# successful `up -d` is just as fatal under 5.1 as a successful git fetch.
+# Any native command in this script must go through one of these two helpers.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$NativeArgs
+    )
+    $ErrorActionPreference = 'Continue'
+    # 2>&1 wraps stderr lines in ErrorRecords, which Out-String renders as a
+    # multi-line "NativeCommandError" dump. Flatten them back to plain text so
+    # ordinary tool output stays readable.
+    $lines = & $Exe @NativeArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+    }
+    $script:NativeExitCode = $LASTEXITCODE
+    return (($lines) -join [Environment]::NewLine)
+}
+
 function Invoke-Git {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
     $ErrorActionPreference = 'Continue'
-    $out = & git @GitArgs 2>&1 | Out-String
+    $lines = & git @GitArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+    }
     $script:GitExitCode = $LASTEXITCODE
-    return $out
+    return (($lines) -join [Environment]::NewLine)
 }
 
 function Test-Admin {
@@ -178,6 +200,7 @@ function Stop-Relay {
 
 # Resolve a working Python launcher once, and reuse it everywhere.
 function Resolve-Python {
+    $ErrorActionPreference = 'Continue'
     foreach ($candidate in @('python', 'py')) {
         $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
@@ -213,7 +236,7 @@ if ($Down) {
     if (Test-Path $ComposeFile) {
         Push-Location $InstallDir
         try {
-            docker compose -f 'docker/docker-compose.yml' down 2>&1 | Out-String | Write-Info
+            Invoke-Native docker compose -f 'docker/docker-compose.yml' down | Write-Info
             Write-Ok 'Compose stack stopped.'
         } finally { Pop-Location }
     } else {
@@ -237,8 +260,8 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 # `docker info` is the only reliable liveness probe; the CLI exists even when
 # the engine is stopped.
-docker info 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$null = Invoke-Native docker info
+if ($script:NativeExitCode -ne 0) {
     Write-Fail 'Docker CLI is present but the engine is not responding.' 'Start Docker Desktop and wait for the whale icon to settle, then re-run.'
 }
 Write-Ok 'Docker engine is responding.'
@@ -493,13 +516,13 @@ try {
     # puts the published multi-arch image in the local cache so Compose
     # reuses it and skips the build entirely.
     $image = 'ruvnet/wifi-densepose:latest'
-    $cached = (docker images -q $image 2>$null | Select-Object -First 1)
+    $cached = ((Invoke-Native docker images -q $image) -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
     if ($cached) {
         Write-Ok "Image already cached locally ($image)."
     } else {
         Write-Info "Pulling $image (avoids a from-source Rust build)..."
-        docker pull $image 2>&1 | Out-String | Write-Info
-        if ($LASTEXITCODE -ne 0) {
+        Invoke-Native docker pull $image | Write-Info
+        if ($script:NativeExitCode -ne 0) {
             Write-Warn 'Pull failed. Compose may now attempt a lengthy from-source build.'
             Write-Info 'A toomanyrequests error means Docker Hub anonymous rate limits - run: docker login'
         } else {
@@ -507,10 +530,10 @@ try {
         }
     }
 
-    docker compose -f 'docker/docker-compose.yml' up -d sensing-server 2>&1 |
+    Invoke-Native docker compose -f 'docker/docker-compose.yml' up -d sensing-server |
         Out-String | Write-Info
 
-    if ($LASTEXITCODE -ne 0) {
+    if ($script:NativeExitCode -ne 0) {
         Stop-Relay
         Write-Fail 'docker compose up failed.' 'Inspect the output above, then retry in the foreground: docker compose -f docker/docker-compose.yml up sensing-server'
     }
@@ -535,7 +558,7 @@ if (-not $healthy) {
     Write-Warn "No 200 from $healthUrl after ~60s."
     Write-Info 'Container logs (last 40 lines):'
     Push-Location $InstallDir
-    try { docker compose -f 'docker/docker-compose.yml' logs --tail 40 sensing-server 2>&1 | Out-String | Write-Info }
+    try { Invoke-Native docker compose -f 'docker/docker-compose.yml' logs --tail 40 sensing-server | Write-Info }
     finally { Pop-Location }
     Write-Info 'Common causes:'
     Write-Info '  exit 64 - issue #864 auth guard. Re-run with -ApiToken generate, or check that the'
