@@ -47,6 +47,23 @@
     Note: 'auto' is deliberately not offered. Since issue #937 it aborts with
     exit code 78 when no source is detected instead of silently falling back.
 
+.PARAMETER ApiToken
+    Secret for RUVIEW_API_TOKEN, which enables authentication on /api/v1/*.
+    Pass 'generate' to mint a random 32-byte hex token.
+
+    Required if you ever republish the TCP ports on a LAN-facing address.
+    Note that enabling auth may stop the bundled browser dashboard from
+    loading data, since its fetches do not attach a bearer token.
+
+.PARAMETER AllowUnauthenticated
+    Sets RUVIEW_ALLOW_UNAUTHENTICATED=1, satisfying the issue #864 guard
+    without a token. This is the default, and it is reasonable *for this
+    compose file specifically* because it publishes the TCP ports as
+    127.0.0.1:3000 and 127.0.0.1:3001 - host loopback only, unreachable from
+    the LAN. Only the UDP CSI port is exposed to the network.
+
+    If you widen those mappings, supply -ApiToken instead.
+
 .PARAMETER SelfTest
     After the stack is healthy, replay synthetic CSI through the full relay
     path and confirm the server's readings actually advance. This validates
@@ -80,6 +97,8 @@ param(
     [ValidateRange(1024, 65535)][int]$ForwardPort = 5006,
     [ValidateRange(1, 65535)][int]$HttpPort = 3000,
     [ValidateSet('esp32', 'simulated', 'wifi')][string]$CsiSource = 'esp32',
+    [string]$ApiToken,
+    [switch]$AllowUnauthenticated,
     [switch]$SkipFirewall,
     [switch]$SelfTest,
     [switch]$Down
@@ -254,26 +273,86 @@ $SynthScript = Join-Path $InstallDir 'scripts\synth-csi-udp.py'
 if (-not (Test-Path $RelayScript)) { Write-Fail "Missing $RelayScript" 'Upstream layout changed; check scripts/ in the repo.' }
 
 # ------------------------------------------------------- compose UDP patch --
-Write-Step 'Applying the Docker Desktop multi-source UDP workaround'
+Write-Step 'Patching docker-compose.yml (UDP mapping + auth passthrough)'
 
 # Compose MERGES list-valued keys such as `ports` across override files rather
 # than replacing them. An override would therefore leave BOTH 5005 and 5006
 # published, and Docker's 5005 bind would then collide with the relay. Editing
 # the mapping in place is what docs/TROUBLESHOOTING.md section 9 prescribes.
 $composeText = Get-Content $ComposeFile -Raw
+$backup = "$ComposeFile.orig"
+$composeDirty = $false
+
 $desired = "- `"$ForwardPort`:5005/udp`""
 $original = '- "5005:5005/udp"'
 
 if ($composeText -match [regex]::Escape($desired)) {
-    Write-Ok "Already patched: host $ForwardPort -> container 5005/udp."
+    Write-Ok "UDP mapping already patched: host $ForwardPort -> container 5005/udp."
 } elseif ($composeText -match [regex]::Escape($original)) {
-    $backup = "$ComposeFile.orig"
     if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
-    ($composeText -replace [regex]::Escape($original), $desired) |
-        Set-Content $ComposeFile -NoNewline -Encoding UTF8
-    Write-Ok "Patched: host $ForwardPort -> container 5005/udp (backup at docker-compose.yml.orig)."
+    $composeText = $composeText -replace [regex]::Escape($original), $desired
+    $composeDirty = $true
+    Write-Ok "UDP mapping patched: host $ForwardPort -> container 5005/udp."
 } else {
     Write-Warn "Could not find the expected '$original' mapping. The upstream compose file may have changed - verify the UDP mapping by hand."
+}
+
+# Issue #864: docker-entrypoint.sh refuses to start (exit 64) when
+# RUVIEW_API_TOKEN is unset and the in-container bind is 0.0.0.0, because
+# /ws/sensing would otherwise stream live vitals to anyone who can reach the
+# socket. Compose only forwards variables that appear in its `environment:`
+# block, so exporting them in the parent shell is not enough - they have to be
+# declared here or they never reach the container.
+$authKeys = @(
+    '      - RUVIEW_ALLOW_UNAUTHENTICATED=${RUVIEW_ALLOW_UNAUTHENTICATED:-}'
+    '      - RUVIEW_API_TOKEN=${RUVIEW_API_TOKEN:-}'
+    '      - RUVIEW_BIND_ADDR=${RUVIEW_BIND_ADDR:-0.0.0.0}'
+)
+if ($composeText -match 'RUVIEW_ALLOW_UNAUTHENTICATED') {
+    Write-Ok 'Auth environment passthrough already declared.'
+} else {
+    $anchor = '      - RUST_LOG=info'
+    if ($composeText.Contains($anchor)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($anchor, ($anchor + "`n" + ($authKeys -join "`n")))
+        $composeDirty = $true
+        Write-Ok 'Added RUVIEW_API_TOKEN / RUVIEW_ALLOW_UNAUTHENTICATED / RUVIEW_BIND_ADDR passthrough.'
+    } else {
+        Write-Warn "Could not find the '$anchor' anchor line; add the RUVIEW_* variables to the environment block by hand."
+    }
+}
+
+if ($composeDirty) {
+    Set-Content $ComposeFile $composeText -NoNewline -Encoding UTF8
+    Write-Info "Backup of the original saved to $backup"
+}
+
+# ------------------------------------------------------------------- auth ---
+Write-Step 'Resolving the security posture (issue #864)'
+
+if ($ApiToken) {
+    if ($ApiToken -eq 'generate') {
+        $ApiToken = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+        Write-Ok 'Generated a random 32-byte API token.'
+        Write-Host "          RUVIEW_API_TOKEN=$ApiToken" -ForegroundColor Yellow
+        Write-Info 'Save this now - it is not persisted anywhere.'
+    } else {
+        Write-Ok 'Using the supplied API token.'
+    }
+    $env:RUVIEW_API_TOKEN = $ApiToken
+    $env:RUVIEW_ALLOW_UNAUTHENTICATED = ''
+    Write-Info 'Auth is enforced on /api/v1/*. The bundled dashboard does not send a bearer token, so it may show no data.'
+} else {
+    # Default. Safe here only because this compose file publishes the TCP
+    # ports on 127.0.0.1, so they are unreachable from the LAN.
+    $env:RUVIEW_ALLOW_UNAUTHENTICATED = '1'
+    $env:RUVIEW_API_TOKEN = ''
+    if (-not $AllowUnauthenticated) {
+        Write-Info 'No -ApiToken given; defaulting to RUVIEW_ALLOW_UNAUTHENTICATED=1.'
+    }
+    Write-Ok 'Unauthenticated mode enabled.'
+    Write-Info 'REST/WebSocket are published on 127.0.0.1 only, so they are not reachable from the LAN.'
+    Write-Info 'If you widen those port mappings, re-run with -ApiToken generate.'
 }
 
 # --------------------------------------------------------------- firewall ---
@@ -326,12 +405,33 @@ try {
     $env:CSI_SOURCE = $CsiSource
     Write-Info "CSI_SOURCE=$CsiSource"
 
+    # docker/docker-compose.yml declares BOTH `build:` and `image:`. When the
+    # image is absent locally, Compose builds it from source rather than
+    # pulling - which compiles the whole Rust workspace (ndarray-linalg with
+    # openblas-static) and takes 20+ minutes or simply fails. Pulling first
+    # puts the published multi-arch image in the local cache so Compose
+    # reuses it and skips the build entirely.
+    $image = 'ruvnet/wifi-densepose:latest'
+    $cached = (docker images -q $image 2>$null | Select-Object -First 1)
+    if ($cached) {
+        Write-Ok "Image already cached locally ($image)."
+    } else {
+        Write-Info "Pulling $image (avoids a from-source Rust build)..."
+        docker pull $image 2>&1 | Out-String | Write-Info
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn 'Pull failed. Compose may now attempt a lengthy from-source build.'
+            Write-Info 'A toomanyrequests error means Docker Hub anonymous rate limits - run: docker login'
+        } else {
+            Write-Ok 'Image pulled.'
+        }
+    }
+
     docker compose -f 'docker/docker-compose.yml' up -d sensing-server 2>&1 |
         Out-String | Write-Info
 
     if ($LASTEXITCODE -ne 0) {
         Stop-Relay
-        Write-Fail 'docker compose up failed.' 'Inspect the output above, then retry: docker compose -f docker/docker-compose.yml up sensing-server'
+        Write-Fail 'docker compose up failed.' 'Inspect the output above, then retry in the foreground: docker compose -f docker/docker-compose.yml up sensing-server'
     }
     Write-Ok 'Container started.'
 } finally { Pop-Location }
@@ -356,7 +456,11 @@ if (-not $healthy) {
     Push-Location $InstallDir
     try { docker compose -f 'docker/docker-compose.yml' logs --tail 40 sensing-server 2>&1 | Out-String | Write-Info }
     finally { Pop-Location }
-    Write-Info 'Exit code 78 means the source probe found nothing - re-run with -CsiSource simulated to confirm the stack itself is sound.'
+    Write-Info 'Common causes:'
+    Write-Info '  exit 64 - issue #864 auth guard. Re-run with -ApiToken generate, or check that the'
+    Write-Info '            RUVIEW_* passthrough lines really are in the compose environment block.'
+    Write-Info '  exit 78 - the CSI source probe found nothing. Re-run with -CsiSource simulated to'
+    Write-Info '            confirm the stack itself is sound before blaming the hardware.'
 } else {
     Write-Ok "Healthy: $healthUrl"
 }
