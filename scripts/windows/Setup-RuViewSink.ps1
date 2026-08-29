@@ -391,10 +391,23 @@ if ($composeText -match 'RUVIEW_ALLOW_UNAUTHENTICATED') {
 $udpKeys = @(
     '      - RUVIEW_UDP_BIND=${RUVIEW_UDP_BIND:-0.0.0.0}'
     '      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-}'
-    '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-}'
+    '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-false}'
 )
 if ($composeText -match 'RUVIEW_UDP_BIND') {
     Write-Ok 'UDP data-plane environment passthrough already declared.'
+    # Repair an earlier revision of this script, which defaulted the flag to an
+    # empty string. RUVIEW_UDP_INSECURE_LAN maps to a Rust bool argument, so an
+    # empty value is present-but-unparseable and the server aborts at startup
+    # with "a value is required for '--udp-insecure-lan'". Only true/false are
+    # accepted, so the default has to be a literal.
+    $brokenBool = '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-}'
+    $fixedBool  = '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-false}'
+    if ($composeText.Contains($brokenBool)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($brokenBool, $fixedBool)
+        $composeDirty = $true
+        Write-Ok 'Repaired RUVIEW_UDP_INSECURE_LAN default (empty -> false).'
+    }
 } else {
     $anchor = '      - RUST_LOG=info'
     if ($composeText.Contains($anchor)) {
@@ -446,11 +459,11 @@ if ($ApiToken) {
 $env:RUVIEW_UDP_BIND = $UdpBind
 if ($UdpInsecureLan) {
     $env:RUVIEW_UDP_ALLOW = ''
-    $env:RUVIEW_UDP_INSECURE_LAN = '1'
+    $env:RUVIEW_UDP_INSECURE_LAN = 'true'
     Write-Warn 'UDP data plane accepts any source (-UdpInsecureLan).'
 } else {
     $env:RUVIEW_UDP_ALLOW = $UdpAllow
-    $env:RUVIEW_UDP_INSECURE_LAN = ''
+    $env:RUVIEW_UDP_INSECURE_LAN = 'false'
     Write-Ok "UDP receiver bind $UdpBind, sources restricted to $UdpAllow"
 }
 
