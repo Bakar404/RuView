@@ -99,6 +99,9 @@ param(
     [ValidateSet('esp32', 'simulated', 'wifi')][string]$CsiSource = 'esp32',
     [string]$ApiToken,
     [switch]$AllowUnauthenticated,
+    [string]$UdpBind = '0.0.0.0',
+    [string]$UdpAllow = '172.16.0.0/12,192.168.65.0/24,10.0.0.0/8',
+    [switch]$UdpInsecureLan,
     [switch]$SkipFirewall,
     [switch]$SelfTest,
     [switch]$Down
@@ -335,6 +338,35 @@ if ($composeText -match 'RUVIEW_ALLOW_UNAUTHENTICATED') {
     }
 }
 
+# ADR-296 (sensor data-plane bind hardening): the UDP CSI receiver binds
+# 127.0.0.1 by default, *independently* of the HTTP --bind-addr. Inside a
+# container that is fatal but silent - Docker delivers forwarded UDP to eth0,
+# never to loopback, so every CSI frame is discarded and the server reports
+# "no data yet" while looking completely healthy.
+#
+# A routable UDP bind is fail-closed: it is refused unless a source policy is
+# supplied. An allowlist scoped to the Docker gateway ranges is the correct
+# choice here, because the only sender is the host-side relay forwarding in
+# through the published port. That is strictly safer than --udp-insecure-lan.
+$udpKeys = @(
+    '      - RUVIEW_UDP_BIND=${RUVIEW_UDP_BIND:-0.0.0.0}'
+    '      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-}'
+    '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-}'
+)
+if ($composeText -match 'RUVIEW_UDP_BIND') {
+    Write-Ok 'UDP data-plane environment passthrough already declared.'
+} else {
+    $anchor = '      - RUST_LOG=info'
+    if ($composeText.Contains($anchor)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($anchor, ($anchor + "`n" + ($udpKeys -join "`n")))
+        $composeDirty = $true
+        Write-Ok 'Added RUVIEW_UDP_BIND / RUVIEW_UDP_ALLOW / RUVIEW_UDP_INSECURE_LAN passthrough.'
+    } else {
+        Write-Warn "Could not find the '$anchor' anchor line; add the UDP variables to the environment block by hand."
+    }
+}
+
 if ($composeDirty) {
     Set-Content $ComposeFile $composeText -NoNewline -Encoding UTF8
     Write-Info "Backup of the original saved to $backup"
@@ -366,6 +398,20 @@ if ($ApiToken) {
     Write-Ok 'Unauthenticated mode enabled.'
     Write-Info 'REST/WebSocket are published on 127.0.0.1 only, so they are not reachable from the LAN.'
     Write-Info 'If you widen those port mappings, re-run with -ApiToken generate.'
+}
+
+# The UDP receiver must bind a routable address inside the container, and that
+# bind is refused without a source policy. Default to an allowlist covering the
+# Docker gateway ranges, since the host relay is the only legitimate sender.
+$env:RUVIEW_UDP_BIND = $UdpBind
+if ($UdpInsecureLan) {
+    $env:RUVIEW_UDP_ALLOW = ''
+    $env:RUVIEW_UDP_INSECURE_LAN = '1'
+    Write-Warn 'UDP data plane accepts any source (-UdpInsecureLan).'
+} else {
+    $env:RUVIEW_UDP_ALLOW = $UdpAllow
+    $env:RUVIEW_UDP_INSECURE_LAN = ''
+    Write-Ok "UDP receiver bind $UdpBind, sources restricted to $UdpAllow"
 }
 
 # --------------------------------------------------------------- firewall ---
