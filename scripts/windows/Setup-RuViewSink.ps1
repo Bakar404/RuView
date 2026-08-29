@@ -381,7 +381,12 @@ if ($SkipFirewall) {
 Write-Step 'Starting the host UDP relay'
 
 $relayLog = Join-Path $env:TEMP 'ruview-udp-relay.log'
-$relayArgs = @($RelayScript, '--listen-port', $ListenPort, '--forward-port', $ForwardPort)
+# -u is essential: Python block-buffers stdout when it is redirected to a
+# file, so without it the relay's banner and its periodic stats never reach
+# the log and the process looks dead even while it is forwarding fine.
+# Note also that udp-relay.py prints its stats from inside the receive loop,
+# so a relay that receives nothing legitimately writes nothing.
+$relayArgs = @('-u', $RelayScript, '--listen-port', $ListenPort, '--forward-port', $ForwardPort)
 
 $relay = Start-Process -FilePath $Python -ArgumentList $relayArgs `
     -RedirectStandardOutput $relayLog -RedirectStandardError "$relayLog.err" `
@@ -476,7 +481,7 @@ if ($SelfTest) {
         # this exercises the identical path the ESP32 nodes will use.
         Write-Info "Replaying ADR-018 frames (magic 0xC5110001) to 127.0.0.1:$ListenPort at 20 Hz for 20s..."
 
-        $synthArgs = @($SynthScript, '--host', '127.0.0.1', '--port', $ListenPort,
+        $synthArgs = @('-u', $SynthScript, '--host', '127.0.0.1', '--port', $ListenPort,
                        '--rate-hz', '20', '--duration-s', '20', '--motion-after-s', '8')
         $synth = Start-Process -FilePath $Python -ArgumentList $synthArgs -WindowStyle Hidden -PassThru
 
@@ -496,12 +501,22 @@ if ($SelfTest) {
         # The relay's own counters are the ground truth for whether datagrams
         # actually traversed the host boundary.
         if (Test-Path $relayLog) {
+            $logText = Get-Content $relayLog -Raw -ErrorAction SilentlyContinue
             $forwarded = Select-String -Path $relayLog -Pattern 'forwarded (\d+) pkts' -ErrorAction SilentlyContinue
             if ($forwarded) {
                 Write-Ok 'Relay confirmed packet flow:'
                 $forwarded | Select-Object -Last 3 | ForEach-Object { Write-Info $_.Line.Trim() }
+            } elseif ($logText -and $logText -match 'listening on') {
+                # Banner present but no stats: the relay is healthy and simply
+                # never received anything. udp-relay.py emits stats only from
+                # inside its receive loop, so silence here means zero packets.
+                Write-Warn 'Relay is alive but forwarded nothing - the synthetic frames never reached it.'
+                Write-Info 'Check that no firewall rule is blocking loopback UDP, and that nothing else holds the port.'
             } else {
-                Write-Warn 'Relay logged no forwarding stats. Frames may not have reached the host socket.'
+                Write-Warn 'Relay log is empty - the process may have died on startup.'
+                if (Test-Path "$relayLog.err") {
+                    Write-Info (Get-Content "$relayLog.err" -Raw)
+                }
             }
         }
     }
