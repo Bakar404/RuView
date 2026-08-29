@@ -251,7 +251,16 @@ Write-Step 'Fetching the RuView repository'
 if (Test-Path (Join-Path $InstallDir '.git')) {
     Push-Location $InstallDir
     try {
-        git fetch --depth 1 origin 2>&1 | Out-String | Write-Info
+        # An existing checkout may be shallow from an earlier version of this
+        # script. Deepen it, otherwise switching branches fails with "did not
+        # match any file(s) known to git" and pulling fails with "refusing to
+        # merge unrelated histories".
+        if ((git rev-parse --is-shallow-repository 2>&1) -eq 'true') {
+            Write-Info 'Existing checkout is shallow - converting it to a full clone...'
+            git fetch --unshallow 2>&1 | Out-String | Write-Info
+        }
+        git remote set-branches origin '*' 2>&1 | Out-String | Write-Info
+        git fetch origin 2>&1 | Out-String | Write-Info
         Write-Ok "Existing checkout refreshed: $InstallDir"
         Write-Info 'Local edits preserved - not doing a hard reset.'
     } finally { Pop-Location }
@@ -259,7 +268,11 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
     if (-not (Test-Path $InstallDir)) {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     }
-    git clone --depth 1 $RepoUrl $InstallDir 2>&1 | Out-String | Write-Info
+    # Deliberately NOT --depth 1. A shallow clone implies --single-branch, which
+    # leaves the checkout unable to see other branches and unable to pull
+    # without hitting unrelated-histories errors. The repo is small enough that
+    # full history costs little and saves a lot of confusion later.
+    git clone $RepoUrl $InstallDir 2>&1 | Out-String | Write-Info
     if ($LASTEXITCODE -ne 0) { Write-Fail "Clone failed from $RepoUrl" 'Check the URL and your network/proxy settings.' }
     Write-Ok "Cloned to $InstallDir"
 }
