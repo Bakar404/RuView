@@ -47,6 +47,23 @@
     Note: 'auto' is deliberately not offered. Since issue #937 it aborts with
     exit code 78 when no source is detected instead of silently falling back.
 
+.PARAMETER ApiToken
+    Secret for RUVIEW_API_TOKEN, which enables authentication on /api/v1/*.
+    Pass 'generate' to mint a random 32-byte hex token.
+
+    Required if you ever republish the TCP ports on a LAN-facing address.
+    Note that enabling auth may stop the bundled browser dashboard from
+    loading data, since its fetches do not attach a bearer token.
+
+.PARAMETER AllowUnauthenticated
+    Sets RUVIEW_ALLOW_UNAUTHENTICATED=1, satisfying the issue #864 guard
+    without a token. This is the default, and it is reasonable *for this
+    compose file specifically* because it publishes the TCP ports as
+    127.0.0.1:3000 and 127.0.0.1:3001 - host loopback only, unreachable from
+    the LAN. Only the UDP CSI port is exposed to the network.
+
+    If you widen those mappings, supply -ApiToken instead.
+
 .PARAMETER SelfTest
     After the stack is healthy, replay synthetic CSI through the full relay
     path and confirm the server's readings actually advance. This validates
@@ -80,6 +97,11 @@ param(
     [ValidateRange(1024, 65535)][int]$ForwardPort = 5006,
     [ValidateRange(1, 65535)][int]$HttpPort = 3000,
     [ValidateSet('esp32', 'simulated', 'wifi')][string]$CsiSource = 'esp32',
+    [string]$ApiToken,
+    [switch]$AllowUnauthenticated,
+    [string]$UdpBind = '0.0.0.0',
+    [string]$UdpAllow = '172.16.0.0/12,192.168.65.0/24,10.0.0.0/8',
+    [switch]$UdpInsecureLan,
     [switch]$SkipFirewall,
     [switch]$SelfTest,
     [switch]$Down
@@ -118,6 +140,42 @@ function Write-Fail {
     exit 1
 }
 
+# git writes ordinary progress ("From https://github.com/...") to stderr. Under
+# $ErrorActionPreference='Stop' Windows PowerShell 5.1 turns any native stderr
+# into a terminating RemoteException, so a perfectly successful fetch aborts the
+# script. Neither 2>$null nor 2>&1 suppresses that in 5.1 - the preference has
+# to be relaxed inside a scope, which is what this function exists to do.
+# Returns combined output; sets $script:GitExitCode for real failure checks.
+# Same hazard, every other native tool. docker compose reports all of its
+# progress ("Container docker-sensing-server-1 Recreate") on stderr, so a
+# successful `up -d` is just as fatal under 5.1 as a successful git fetch.
+# Any native command in this script must go through one of these two helpers.
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [Parameter(ValueFromRemainingArguments = $true)][string[]]$NativeArgs
+    )
+    $ErrorActionPreference = 'Continue'
+    # 2>&1 wraps stderr lines in ErrorRecords, which Out-String renders as a
+    # multi-line "NativeCommandError" dump. Flatten them back to plain text so
+    # ordinary tool output stays readable.
+    $lines = & $Exe @NativeArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+    }
+    $script:NativeExitCode = $LASTEXITCODE
+    return (($lines) -join [Environment]::NewLine)
+}
+
+function Invoke-Git {
+    param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+    $ErrorActionPreference = 'Continue'
+    $lines = & git @GitArgs 2>&1 | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.ToString() } else { $_ }
+    }
+    $script:GitExitCode = $LASTEXITCODE
+    return (($lines) -join [Environment]::NewLine)
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
@@ -142,6 +200,7 @@ function Stop-Relay {
 
 # Resolve a working Python launcher once, and reuse it everywhere.
 function Resolve-Python {
+    $ErrorActionPreference = 'Continue'
     foreach ($candidate in @('python', 'py')) {
         $cmd = Get-Command $candidate -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
@@ -177,7 +236,7 @@ if ($Down) {
     if (Test-Path $ComposeFile) {
         Push-Location $InstallDir
         try {
-            docker compose -f 'docker/docker-compose.yml' down 2>&1 | Out-String | Write-Info
+            Invoke-Native docker compose -f 'docker/docker-compose.yml' down | Write-Info
             Write-Ok 'Compose stack stopped.'
         } finally { Pop-Location }
     } else {
@@ -201,8 +260,8 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 }
 # `docker info` is the only reliable liveness probe; the CLI exists even when
 # the engine is stopped.
-docker info 2>&1 | Out-Null
-if ($LASTEXITCODE -ne 0) {
+$null = Invoke-Native docker info
+if ($script:NativeExitCode -ne 0) {
     Write-Fail 'Docker CLI is present but the engine is not responding.' 'Start Docker Desktop and wait for the whale icon to settle, then re-run.'
 }
 Write-Ok 'Docker engine is responding.'
@@ -232,7 +291,19 @@ Write-Step 'Fetching the RuView repository'
 if (Test-Path (Join-Path $InstallDir '.git')) {
     Push-Location $InstallDir
     try {
-        git fetch --depth 1 origin 2>&1 | Out-String | Write-Info
+        # An existing checkout may be shallow from an earlier version of this
+        # script. Deepen it, otherwise switching branches fails with "did not
+        # match any file(s) known to git" and pulling fails with "refusing to
+        # merge unrelated histories".
+        if ((Invoke-Git rev-parse --is-shallow-repository).Trim() -eq 'true') {
+            Write-Info 'Existing checkout is shallow - converting it to a full clone...'
+            Invoke-Git fetch --unshallow | Write-Info
+        }
+        Invoke-Git remote set-branches origin '*' | Write-Info
+        Invoke-Git fetch origin | Write-Info
+        if ($script:GitExitCode -ne 0) {
+            Write-Warn 'git fetch reported a failure; continuing with the existing checkout.'
+        }
         Write-Ok "Existing checkout refreshed: $InstallDir"
         Write-Info 'Local edits preserved - not doing a hard reset.'
     } finally { Pop-Location }
@@ -240,8 +311,12 @@ if (Test-Path (Join-Path $InstallDir '.git')) {
     if (-not (Test-Path $InstallDir)) {
         New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     }
-    git clone --depth 1 $RepoUrl $InstallDir 2>&1 | Out-String | Write-Info
-    if ($LASTEXITCODE -ne 0) { Write-Fail "Clone failed from $RepoUrl" 'Check the URL and your network/proxy settings.' }
+    # Deliberately NOT --depth 1. A shallow clone implies --single-branch, which
+    # leaves the checkout unable to see other branches and unable to pull
+    # without hitting unrelated-histories errors. The repo is small enough that
+    # full history costs little and saves a lot of confusion later.
+    Invoke-Git clone $RepoUrl $InstallDir | Write-Info
+    if ($script:GitExitCode -ne 0) { Write-Fail "Clone failed from $RepoUrl" 'Check the URL and your network/proxy settings.' }
     Write-Ok "Cloned to $InstallDir"
 }
 
@@ -254,26 +329,142 @@ $SynthScript = Join-Path $InstallDir 'scripts\synth-csi-udp.py'
 if (-not (Test-Path $RelayScript)) { Write-Fail "Missing $RelayScript" 'Upstream layout changed; check scripts/ in the repo.' }
 
 # ------------------------------------------------------- compose UDP patch --
-Write-Step 'Applying the Docker Desktop multi-source UDP workaround'
+Write-Step 'Patching docker-compose.yml (UDP mapping + auth passthrough)'
 
 # Compose MERGES list-valued keys such as `ports` across override files rather
 # than replacing them. An override would therefore leave BOTH 5005 and 5006
 # published, and Docker's 5005 bind would then collide with the relay. Editing
 # the mapping in place is what docs/TROUBLESHOOTING.md section 9 prescribes.
 $composeText = Get-Content $ComposeFile -Raw
+$backup = "$ComposeFile.orig"
+$composeDirty = $false
+
 $desired = "- `"$ForwardPort`:5005/udp`""
 $original = '- "5005:5005/udp"'
 
 if ($composeText -match [regex]::Escape($desired)) {
-    Write-Ok "Already patched: host $ForwardPort -> container 5005/udp."
+    Write-Ok "UDP mapping already patched: host $ForwardPort -> container 5005/udp."
 } elseif ($composeText -match [regex]::Escape($original)) {
-    $backup = "$ComposeFile.orig"
     if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
-    ($composeText -replace [regex]::Escape($original), $desired) |
-        Set-Content $ComposeFile -NoNewline -Encoding UTF8
-    Write-Ok "Patched: host $ForwardPort -> container 5005/udp (backup at docker-compose.yml.orig)."
+    $composeText = $composeText -replace [regex]::Escape($original), $desired
+    $composeDirty = $true
+    Write-Ok "UDP mapping patched: host $ForwardPort -> container 5005/udp."
 } else {
     Write-Warn "Could not find the expected '$original' mapping. The upstream compose file may have changed - verify the UDP mapping by hand."
+}
+
+# Issue #864: docker-entrypoint.sh refuses to start (exit 64) when
+# RUVIEW_API_TOKEN is unset and the in-container bind is 0.0.0.0, because
+# /ws/sensing would otherwise stream live vitals to anyone who can reach the
+# socket. Compose only forwards variables that appear in its `environment:`
+# block, so exporting them in the parent shell is not enough - they have to be
+# declared here or they never reach the container.
+$authKeys = @(
+    '      - RUVIEW_ALLOW_UNAUTHENTICATED=${RUVIEW_ALLOW_UNAUTHENTICATED:-}'
+    '      - RUVIEW_API_TOKEN=${RUVIEW_API_TOKEN:-}'
+    '      - RUVIEW_BIND_ADDR=${RUVIEW_BIND_ADDR:-0.0.0.0}'
+)
+if ($composeText -match 'RUVIEW_ALLOW_UNAUTHENTICATED') {
+    Write-Ok 'Auth environment passthrough already declared.'
+} else {
+    $anchor = '      - RUST_LOG=info'
+    if ($composeText.Contains($anchor)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($anchor, ($anchor + "`n" + ($authKeys -join "`n")))
+        $composeDirty = $true
+        Write-Ok 'Added RUVIEW_API_TOKEN / RUVIEW_ALLOW_UNAUTHENTICATED / RUVIEW_BIND_ADDR passthrough.'
+    } else {
+        Write-Warn "Could not find the '$anchor' anchor line; add the RUVIEW_* variables to the environment block by hand."
+    }
+}
+
+# ADR-296 (sensor data-plane bind hardening): the UDP CSI receiver binds
+# 127.0.0.1 by default, *independently* of the HTTP --bind-addr. Inside a
+# container that is fatal but silent - Docker delivers forwarded UDP to eth0,
+# never to loopback, so every CSI frame is discarded and the server reports
+# "no data yet" while looking completely healthy.
+#
+# A routable UDP bind is fail-closed: it is refused unless a source policy is
+# supplied. An allowlist scoped to the Docker gateway ranges is the correct
+# choice here, because the only sender is the host-side relay forwarding in
+# through the published port. That is strictly safer than --udp-insecure-lan.
+$udpKeys = @(
+    '      - RUVIEW_UDP_BIND=${RUVIEW_UDP_BIND:-0.0.0.0}'
+    '      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-}'
+    '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-false}'
+)
+if ($composeText -match 'RUVIEW_UDP_BIND') {
+    Write-Ok 'UDP data-plane environment passthrough already declared.'
+    # Repair an earlier revision of this script, which defaulted the flag to an
+    # empty string. RUVIEW_UDP_INSECURE_LAN maps to a Rust bool argument, so an
+    # empty value is present-but-unparseable and the server aborts at startup
+    # with "a value is required for '--udp-insecure-lan'". Only true/false are
+    # accepted, so the default has to be a literal.
+    $brokenBool = '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-}'
+    $fixedBool  = '      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-false}'
+    if ($composeText.Contains($brokenBool)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($brokenBool, $fixedBool)
+        $composeDirty = $true
+        Write-Ok 'Repaired RUVIEW_UDP_INSECURE_LAN default (empty -> false).'
+    }
+} else {
+    $anchor = '      - RUST_LOG=info'
+    if ($composeText.Contains($anchor)) {
+        if (-not (Test-Path $backup)) { Copy-Item $ComposeFile $backup }
+        $composeText = $composeText.Replace($anchor, ($anchor + "`n" + ($udpKeys -join "`n")))
+        $composeDirty = $true
+        Write-Ok 'Added RUVIEW_UDP_BIND / RUVIEW_UDP_ALLOW / RUVIEW_UDP_INSECURE_LAN passthrough.'
+    } else {
+        Write-Warn "Could not find the '$anchor' anchor line; add the UDP variables to the environment block by hand."
+    }
+}
+
+if ($composeDirty) {
+    Set-Content $ComposeFile $composeText -NoNewline -Encoding UTF8
+    Write-Info "Backup of the original saved to $backup"
+}
+
+# ------------------------------------------------------------------- auth ---
+Write-Step 'Resolving the security posture (issue #864)'
+
+if ($ApiToken) {
+    if ($ApiToken -eq 'generate') {
+        $ApiToken = -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+        Write-Ok 'Generated a random 32-byte API token.'
+        Write-Host "          RUVIEW_API_TOKEN=$ApiToken" -ForegroundColor Yellow
+        Write-Info 'Save this now - it is not persisted anywhere.'
+    } else {
+        Write-Ok 'Using the supplied API token.'
+    }
+    $env:RUVIEW_API_TOKEN = $ApiToken
+    $env:RUVIEW_ALLOW_UNAUTHENTICATED = ''
+    Write-Info 'Auth is enforced on /api/v1/*. The bundled dashboard does not send a bearer token, so it may show no data.'
+} else {
+    # Default. Safe here only because this compose file publishes the TCP
+    # ports on 127.0.0.1, so they are unreachable from the LAN.
+    $env:RUVIEW_ALLOW_UNAUTHENTICATED = '1'
+    $env:RUVIEW_API_TOKEN = ''
+    if (-not $AllowUnauthenticated) {
+        Write-Info 'No -ApiToken given; defaulting to RUVIEW_ALLOW_UNAUTHENTICATED=1.'
+    }
+    Write-Ok 'Unauthenticated mode enabled.'
+    Write-Info 'REST/WebSocket are published on 127.0.0.1 only, so they are not reachable from the LAN.'
+    Write-Info 'If you widen those port mappings, re-run with -ApiToken generate.'
+}
+
+# The UDP receiver must bind a routable address inside the container, and that
+# bind is refused without a source policy. Default to an allowlist covering the
+# Docker gateway ranges, since the host relay is the only legitimate sender.
+$env:RUVIEW_UDP_BIND = $UdpBind
+if ($UdpInsecureLan) {
+    $env:RUVIEW_UDP_ALLOW = ''
+    $env:RUVIEW_UDP_INSECURE_LAN = 'true'
+    Write-Warn 'UDP data plane accepts any source (-UdpInsecureLan).'
+} else {
+    $env:RUVIEW_UDP_ALLOW = $UdpAllow
+    $env:RUVIEW_UDP_INSECURE_LAN = 'false'
+    Write-Ok "UDP receiver bind $UdpBind, sources restricted to $UdpAllow"
 }
 
 # --------------------------------------------------------------- firewall ---
@@ -302,7 +493,12 @@ if ($SkipFirewall) {
 Write-Step 'Starting the host UDP relay'
 
 $relayLog = Join-Path $env:TEMP 'ruview-udp-relay.log'
-$relayArgs = @($RelayScript, '--listen-port', $ListenPort, '--forward-port', $ForwardPort)
+# -u is essential: Python block-buffers stdout when it is redirected to a
+# file, so without it the relay's banner and its periodic stats never reach
+# the log and the process looks dead even while it is forwarding fine.
+# Note also that udp-relay.py prints its stats from inside the receive loop,
+# so a relay that receives nothing legitimately writes nothing.
+$relayArgs = @('-u', $RelayScript, '--listen-port', $ListenPort, '--forward-port', $ForwardPort)
 
 $relay = Start-Process -FilePath $Python -ArgumentList $relayArgs `
     -RedirectStandardOutput $relayLog -RedirectStandardError "$relayLog.err" `
@@ -326,12 +522,33 @@ try {
     $env:CSI_SOURCE = $CsiSource
     Write-Info "CSI_SOURCE=$CsiSource"
 
-    docker compose -f 'docker/docker-compose.yml' up -d sensing-server 2>&1 |
+    # docker/docker-compose.yml declares BOTH `build:` and `image:`. When the
+    # image is absent locally, Compose builds it from source rather than
+    # pulling - which compiles the whole Rust workspace (ndarray-linalg with
+    # openblas-static) and takes 20+ minutes or simply fails. Pulling first
+    # puts the published multi-arch image in the local cache so Compose
+    # reuses it and skips the build entirely.
+    $image = 'ruvnet/wifi-densepose:latest'
+    $cached = ((Invoke-Native docker images -q $image) -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
+    if ($cached) {
+        Write-Ok "Image already cached locally ($image)."
+    } else {
+        Write-Info "Pulling $image (avoids a from-source Rust build)..."
+        Invoke-Native docker pull $image | Write-Info
+        if ($script:NativeExitCode -ne 0) {
+            Write-Warn 'Pull failed. Compose may now attempt a lengthy from-source build.'
+            Write-Info 'A toomanyrequests error means Docker Hub anonymous rate limits - run: docker login'
+        } else {
+            Write-Ok 'Image pulled.'
+        }
+    }
+
+    Invoke-Native docker compose -f 'docker/docker-compose.yml' up -d sensing-server |
         Out-String | Write-Info
 
-    if ($LASTEXITCODE -ne 0) {
+    if ($script:NativeExitCode -ne 0) {
         Stop-Relay
-        Write-Fail 'docker compose up failed.' 'Inspect the output above, then retry: docker compose -f docker/docker-compose.yml up sensing-server'
+        Write-Fail 'docker compose up failed.' 'Inspect the output above, then retry in the foreground: docker compose -f docker/docker-compose.yml up sensing-server'
     }
     Write-Ok 'Container started.'
 } finally { Pop-Location }
@@ -354,9 +571,13 @@ if (-not $healthy) {
     Write-Warn "No 200 from $healthUrl after ~60s."
     Write-Info 'Container logs (last 40 lines):'
     Push-Location $InstallDir
-    try { docker compose -f 'docker/docker-compose.yml' logs --tail 40 sensing-server 2>&1 | Out-String | Write-Info }
+    try { Invoke-Native docker compose -f 'docker/docker-compose.yml' logs --tail 40 sensing-server | Write-Info }
     finally { Pop-Location }
-    Write-Info 'Exit code 78 means the source probe found nothing - re-run with -CsiSource simulated to confirm the stack itself is sound.'
+    Write-Info 'Common causes:'
+    Write-Info '  exit 64 - issue #864 auth guard. Re-run with -ApiToken generate, or check that the'
+    Write-Info '            RUVIEW_* passthrough lines really are in the compose environment block.'
+    Write-Info '  exit 78 - the CSI source probe found nothing. Re-run with -CsiSource simulated to'
+    Write-Info '            confirm the stack itself is sound before blaming the hardware.'
 } else {
     Write-Ok "Healthy: $healthUrl"
 }
@@ -372,7 +593,7 @@ if ($SelfTest) {
         # this exercises the identical path the ESP32 nodes will use.
         Write-Info "Replaying ADR-018 frames (magic 0xC5110001) to 127.0.0.1:$ListenPort at 20 Hz for 20s..."
 
-        $synthArgs = @($SynthScript, '--host', '127.0.0.1', '--port', $ListenPort,
+        $synthArgs = @('-u', $SynthScript, '--host', '127.0.0.1', '--port', $ListenPort,
                        '--rate-hz', '20', '--duration-s', '20', '--motion-after-s', '8')
         $synth = Start-Process -FilePath $Python -ArgumentList $synthArgs -WindowStyle Hidden -PassThru
 
@@ -392,12 +613,22 @@ if ($SelfTest) {
         # The relay's own counters are the ground truth for whether datagrams
         # actually traversed the host boundary.
         if (Test-Path $relayLog) {
+            $logText = Get-Content $relayLog -Raw -ErrorAction SilentlyContinue
             $forwarded = Select-String -Path $relayLog -Pattern 'forwarded (\d+) pkts' -ErrorAction SilentlyContinue
             if ($forwarded) {
                 Write-Ok 'Relay confirmed packet flow:'
                 $forwarded | Select-Object -Last 3 | ForEach-Object { Write-Info $_.Line.Trim() }
+            } elseif ($logText -and $logText -match 'listening on') {
+                # Banner present but no stats: the relay is healthy and simply
+                # never received anything. udp-relay.py emits stats only from
+                # inside its receive loop, so silence here means zero packets.
+                Write-Warn 'Relay is alive but forwarded nothing - the synthetic frames never reached it.'
+                Write-Info 'Check that no firewall rule is blocking loopback UDP, and that nothing else holds the port.'
             } else {
-                Write-Warn 'Relay logged no forwarding stats. Frames may not have reached the host socket.'
+                Write-Warn 'Relay log is empty - the process may have died on startup.'
+                if (Test-Path "$relayLog.err") {
+                    Write-Info (Get-Content "$relayLog.err" -Raw)
+                }
             }
         }
     }
