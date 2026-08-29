@@ -69,6 +69,8 @@ def main():
     parser.add_argument("--port", type=int, default=5005, help="UDP port (default: 5005)")
     parser.add_argument("--duration", type=int, default=300, help="Duration in seconds (default: 300)")
     parser.add_argument("--output", default="data/recordings", help="Output directory")
+    parser.add_argument("--stop-file", default=None,
+                        help="Exit cleanly when this file appears")
     args = parser.parse_args()
 
     os.makedirs(args.output, exist_ok=True)
@@ -90,6 +92,8 @@ def main():
     with open(filepath, "w") as f:
         try:
             while time.time() - start < args.duration:
+                if args.stop_file and os.path.exists(args.stop_file):
+                    break
                 try:
                     data, addr = sock.recvfrom(4096)
                     frame = parse_csi_packet(data)

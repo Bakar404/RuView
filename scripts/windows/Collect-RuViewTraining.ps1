@@ -38,11 +38,14 @@ New-Item -ItemType Directory -Force -Path $gtDir, $csiDir, $pairedDir | Out-Null
 $started = Get-Date
 $recorderLog = Join-Path $env:TEMP 'ruview-training-recorder.log'
 $recorderErr = "$recorderLog.err"
+$stopFile = Join-Path $env:TEMP "ruview-training-stop-$PID.flag"
+Remove-Item $stopFile -ErrorAction SilentlyContinue
 $recorder = Start-Process -FilePath $python -ArgumentList @(
     (Join-Path $repo 'scripts\record-csi-udp.py'),
     '--port', $TapPort,
     '--duration', $Duration,
-    '--output', $csiDir
+    '--output', $csiDir,
+    '--stop-file', $stopFile
 ) -RedirectStandardOutput $recorderLog -RedirectStandardError $recorderErr -PassThru
 
 Start-Sleep -Seconds 2
@@ -68,11 +71,13 @@ try {
     }
 } finally {
     if (-not $recorder.HasExited) {
-        $recorder.WaitForExit(($Duration + 15) * 1000) | Out-Null
+        Set-Content $stopFile 'stop'
+        $recorder.WaitForExit(5000) | Out-Null
     }
     if (-not $recorder.HasExited) {
         Stop-Process -Id $recorder.Id -Force
     }
+    Remove-Item $stopFile -ErrorAction SilentlyContinue
 }
 
 $groundTruth = Get-ChildItem $gtDir -Filter 'keypoints_*.jsonl' |
