@@ -1,5 +1,25 @@
 # π RuView
 
+> [!NOTE]
+> **Bakar404 fork:** This fork tracks [`ruvnet/RuView`](https://github.com/ruvnet/RuView)
+> and keeps workstation-specific deployment changes on `main`. Compared with
+> the upstream repository, it adds a Windows 11 setup path for a three-node
+> ESP32-S3 mesh:
+>
+> - `scripts/windows/Setup-RuViewSink.ps1` configures Docker, loopback-only
+>   HTTP/WebSocket access, API and UDP security variables, the Windows
+>   firewall, and a host UDP relay.
+> - Docker publishes host UDP `5006` to container UDP `5005`; the relay accepts
+>   the ESP32 traffic on UDP `5005` and forwards it to `127.0.0.1:5006`. This
+>   avoids Docker Desktop's multi-source UDP loss on Windows.
+> - `scripts/windows/Flash-RuViewNode.ps1` flashes and provisions each board
+>   with unique node and TDM slot settings.
+> - The setup scripts handle PowerShell 5.1 native-command stderr safely and
+>   pre-pull the published image to avoid an accidental full Rust source build.
+>
+> The validated local deployment uses three active nodes targeting the sink's
+> LAN address and serves the dashboard at `http://localhost:3000`.
+
 <p align="center">
   <a href="https://cognitum.one/seed">
     <img src="assets/ruview-seed.png" alt="RuView - WiFi DensePose" width="100%">

@@ -20,9 +20,15 @@ services:
       #   python scripts/udp-relay.py --listen-port 5005 --forward-port 5006
       #
       # See docs/TROUBLESHOOTING.md §9 for details.
-      - "5005:5005/udp"
+      - "5006:5005/udp"
     environment:
       - RUST_LOG=info
+      - RUVIEW_UDP_BIND=${RUVIEW_UDP_BIND:-0.0.0.0}
+      - RUVIEW_UDP_ALLOW=${RUVIEW_UDP_ALLOW:-}
+      - RUVIEW_UDP_INSECURE_LAN=${RUVIEW_UDP_INSECURE_LAN:-false}
+      - RUVIEW_ALLOW_UNAUTHENTICATED=${RUVIEW_ALLOW_UNAUTHENTICATED:-}
+      - RUVIEW_API_TOKEN=${RUVIEW_API_TOKEN:-}
+      - RUVIEW_BIND_ADDR=${RUVIEW_BIND_ADDR:-0.0.0.0}
       # CSI_SOURCE controls the data source for the sensing server.
       # Options: auto (default) — probe for ESP32 UDP then host WiFi; **fail
       #                           hard with exit 78 if neither is detected**.
