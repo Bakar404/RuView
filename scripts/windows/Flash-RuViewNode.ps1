@@ -214,15 +214,45 @@ if ($Port) {
     if (-not $ports -or $ports.Count -eq 0) {
         Write-Fail 'No serial ports found.' 'Connect the board over USB. If nothing appears, the board may need a CP210x or CH340 driver, or you may be using a charge-only USB cable - a surprisingly common cause.'
     }
-    if ($ports.Count -gt 1) {
+
+    # Desktops commonly expose a motherboard serial port, so "more than one
+    # port" is normal and does not mean the board is ambiguous. Identify the
+    # ESP32 by its USB bridge instead of making the user guess a number.
+    $espPattern = 'CP210|CH34|CH91|FT232|Silicon Labs|USB.?SERIAL|JTAG/serial|USB Serial Device'
+    $named = @()
+    Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '\(COM\d+\)' } |
+        ForEach-Object {
+            $null = $_.Name -match '\((COM\d+)\)'
+            $named += [pscustomobject]@{ Port = $Matches[1]; Name = $_.Name }
+        }
+
+    $likely = @($named | Where-Object { $_.Name -match $espPattern -and $ports -contains $_.Port })
+
+    if ($ports.Count -eq 1) {
+        $Port = $ports[0]
+        Write-Ok "Auto-detected: $Port"
+    } elseif ($likely.Count -eq 1) {
+        $Port = $likely[0].Port
+        Write-Ok "Auto-detected: $Port"
+        Write-Info "Matched: $($likely[0].Name)"
+        $others = @($ports | Where-Object { $_ -ne $Port })
+        if ($others) { Write-Info "Ignored non-ESP32 ports: $($others -join ', ')" }
+    } else {
         Write-Info 'Several ports present:'
-        Get-CimInstance Win32_PnPEntity -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -match '\(COM\d+\)' } |
-            ForEach-Object { Write-Info "  $($_.Name)" }
-        Write-Fail "Ambiguous port selection: $($ports -join ', ')" 'Re-run with -Port COMn to pick one.'
+        if ($named) {
+            $named | ForEach-Object { Write-Info "  $($_.Name)" }
+        } else {
+            $ports | ForEach-Object { Write-Info "  $_" }
+        }
+        if ($likely.Count -gt 1) {
+            Write-Info ''
+            Write-Info "More than one looks like an ESP32: $(($likely | ForEach-Object { $_.Port }) -join ', ')"
+            Write-Info 'If only one board is connected, this board exposes both a USB-serial bridge and'
+            Write-Info 'native USB. Prefer the CP210x/CH340 bridge port for flashing.'
+        }
+        Write-Fail "Ambiguous port selection: $($ports -join ', ')" 'Re-run with -Port COMn to pick one. The ESP32 is the CP210x, CH340, or USB JTAG/serial entry above - not a plain "Communications Port".'
     }
-    $Port = $ports[0]
-    Write-Ok "Auto-detected: $Port"
 }
 
 # --------------------------------------------------------------- sink addr --
