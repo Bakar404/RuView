@@ -103,6 +103,16 @@ ENV MODELS_DIR=data/models
 
 COPY docker/docker-entrypoint.sh /app/docker-entrypoint.sh
 
+# Normalise line endings and ensure the exec bit. A Windows checkout (or any
+# clone without a .gitattributes eol rule) leaves CRLF in the script, and the
+# kernel then reads the shebang as "/bin/sh\r", failing at exec time with the
+# misleading "no such file or directory". Fixing it here keeps the image
+# buildable from any host regardless of the developer's checkout settings.
+RUN sed -i 's/\r$//' /app/docker-entrypoint.sh \
+    && chmod +x /app/docker-entrypoint.sh \
+    && head -c 2 /app/docker-entrypoint.sh | grep -q '#!' \
+    && echo "entrypoint normalised OK"
+
 # Exec-form ENTRYPOINT so Docker appends user arguments correctly.
 # Pass flags directly:  docker run <image> --source esp32 --tick-ms 500
 # Or use env vars:      docker run -e CSI_SOURCE=esp32 <image>

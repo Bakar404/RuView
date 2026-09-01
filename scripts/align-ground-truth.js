@@ -248,6 +248,10 @@ function loadCsi(filePath) {
             nodeId: node.node_id,
             subcarriers: node.amplitude.length,
             amplitude: node.amplitude, // pre-extracted, no iq_hex needed
+            // Phase is present only in recordings made after phase was plumbed
+            // through the sensing server. Older amplitude-only captures leave
+            // this undefined, and the pose pipeline then omits the phase file.
+            phase: Array.isArray(node.phase) ? node.phase : null,
             rssi: node.rssi_dbm,
             seq: r.tick,
           });
@@ -308,6 +312,95 @@ function groupIntoWindows(frames, windowSize) {
   return windows;
 }
 
+/**
+ * Detect whether the CSI stream carries several nodes sampled at a shared tick.
+ *
+ * `sensing_update` records emit every node under one tick timestamp, so the
+ * flat frame list is a round-robin over nodes. Slicing that list positionally
+ * puts a different node at a given feature index whenever windowSize is not a
+ * multiple of the node count (20 % 3 == 2 rotates the phase every window),
+ * which scrambles the input space and makes the CSI->pose mapping unlearnable.
+ * Legacy `raw_csi`/`feature` streams timestamp each node independently, so
+ * they form 1-node ticks and must keep the original positional behaviour.
+ */
+function detectNodeAxis(frames) {
+  const nodeIds = [...new Set(frames.map((f) => f.nodeId).filter((n) => n != null))].sort((a, b) => a - b);
+  if (nodeIds.length < 2) return null;
+  const perTick = new Map();
+  for (const f of frames) perTick.set(f.tsMs, (perTick.get(f.tsMs) || 0) + 1);
+  const sizes = [...perTick.values()].sort((a, b) => a - b);
+  const median = sizes[Math.floor(sizes.length / 2)];
+  return median === nodeIds.length ? nodeIds : null;
+}
+
+/**
+ * Collapse per-node frames into ticks with a fixed, node-sorted axis.
+ * Ticks missing any node are dropped rather than zero-filled, matching the
+ * no-silent-padding rule established for subcarrier width (#1007 Bug 3).
+ */
+function groupIntoTicks(frames, nodeIds) {
+  const byTs = new Map();
+  for (const f of frames) {
+    if (f.nodeId == null) continue;
+    if (!byTs.has(f.tsMs)) byTs.set(f.tsMs, new Map());
+    // Keep the first frame per node; a duplicate within one tick is a repeat.
+    if (!byTs.get(f.tsMs).has(f.nodeId)) byTs.get(f.tsMs).set(f.nodeId, f);
+  }
+  const ticks = [];
+  let dropped = 0;
+  for (const tsMs of [...byTs.keys()].sort((a, b) => a - b)) {
+    const m = byTs.get(tsMs);
+    if (nodeIds.some((n) => !m.has(n))) { dropped++; continue; }
+    ticks.push({ tsMs, nodes: nodeIds.map((n) => m.get(n)) });
+  }
+  if (dropped > 0) {
+    console.error(`[align] dropped ${dropped} incomplete ticks (missing >=1 of nodes ${nodeIds.join(',')}); no zero-fill`);
+  }
+  return ticks;
+}
+
+/**
+ * Build a CSI matrix with an explicit node axis.
+ * Fill order is [tick, node, subcarrier] with nodes in ascending node_id, so a
+ * given flat index always refers to the same physical node in every window.
+ */
+function extractCsiMatrixNodeAxis(window, nodeIds) {
+  const nTicks = window.length;
+  const nNodes = nodeIds.length;
+  const nSc = window[0].nodes[0].subcarriers || 128;
+  const matrix = new Float32Array(nTicks * nNodes * nSc);
+
+  // Phase is emitted only when every frame in the window carries it; a
+  // partially-populated phase tensor would silently mix measured radians with
+  // zeros, which is indistinguishable from a real 0-radian measurement.
+  const hasPhase = window.every((t) =>
+    t.nodes.every((f) => Array.isArray(f.phase) && f.phase.length > 0));
+  const phaseMatrix = hasPhase ? new Float32Array(nTicks * nNodes * nSc) : null;
+
+  for (let t = 0; t < nTicks; t++) {
+    for (let n = 0; n < nNodes; n++) {
+      const frame = window[t].nodes[n];
+      const base = (t * nNodes + n) * nSc;
+      if (frame.amplitude && frame.amplitude.length > 0) {
+        const len = Math.min(nSc, frame.amplitude.length);
+        for (let s = 0; s < len; s++) matrix[base + s] = frame.amplitude[s];
+      } else if (frame.iqHex) {
+        matrix.set(extractAmplitude(parseIqHex(frame.iqHex), nSc), base);
+      }
+      if (phaseMatrix) {
+        const len = Math.min(nSc, frame.phase.length);
+        for (let s = 0; s < len; s++) phaseMatrix[base + s] = frame.phase[s];
+      }
+    }
+  }
+
+  return {
+    data: Array.from(matrix),
+    shape: [nTicks, nNodes, nSc],
+    phase: phaseMatrix ? Array.from(phaseMatrix) : null,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Camera frame matching (binary search)
 // ---------------------------------------------------------------------------
@@ -343,7 +436,7 @@ function findCameraFramesInRange(cameraFrames, tStartMs, tEndMs) {
  */
 function averageKeypoints(cameraFrames) {
   let totalWeight = 0;
-  const sumKp = new Array(NUM_KEYPOINTS).fill(null).map(() => [0, 0]);
+  const sumKp = new Array(NUM_KEYPOINTS).fill(null).map(() => [0, 0, 0]);
 
   for (const f of cameraFrames) {
     const w = f.confidence || 1e-6;
@@ -351,11 +444,20 @@ function averageKeypoints(cameraFrames) {
     for (let k = 0; k < NUM_KEYPOINTS && k < f.keypoints.length; k++) {
       sumKp[k][0] += f.keypoints[k][0] * w;
       sumKp[k][1] += f.keypoints[k][1] * w;
+      // Third component is the COCO visibility flag. Files produced before
+      // visibility was emitted carry only [x, y]; treat those as visible so
+      // older captures keep their previous behaviour.
+      const vis = f.keypoints[k].length > 2 ? f.keypoints[k][2] : 1.0;
+      sumKp[k][2] += vis * w;
     }
   }
 
   if (totalWeight === 0) totalWeight = 1;
-  const keypoints = sumKp.map(([x, y]) => [x / totalWeight, y / totalWeight]);
+  const keypoints = sumKp.map(([x, y, v]) => [
+    x / totalWeight,
+    y / totalWeight,
+    v / totalWeight,
+  ]);
   const avgConfidence = cameraFrames.reduce((s, f) => s + (f.confidence || 0), 0) / cameraFrames.length;
 
   return { keypoints, avgConfidence };
@@ -472,8 +574,18 @@ function align() {
   }
   console.log();
 
-  // Group CSI into windows
-  const windows = groupIntoWindows(csiSource, WINDOW_FRAMES);
+  // Group CSI into windows. When several nodes share a tick, window over ticks
+  // so every window holds whole ticks and the node axis stays aligned.
+  const nodeIds = useRawCsi ? detectNodeAxis(csiSource) : null;
+  let windows;
+  if (nodeIds) {
+    const ticks = groupIntoTicks(csiSource, nodeIds);
+    console.log(`Detected ${nodeIds.length} nodes per tick (ids ${nodeIds.join(',')}); windowing over ticks`);
+    console.log(`  ${ticks.length} complete ticks from ${csiSource.length} frames`);
+    windows = groupIntoWindows(ticks, WINDOW_FRAMES);
+  } else {
+    windows = groupIntoWindows(csiSource, WINDOW_FRAMES);
+  }
   console.log(`Grouped into ${windows.length} CSI windows`);
 
   // Align
@@ -503,9 +615,11 @@ function align() {
     const { keypoints, avgConfidence } = averageKeypoints(matched);
 
     // Extract CSI matrix
-    const csiMatrix = useRawCsi
-      ? extractCsiMatrix(window)
-      : extractFeatureMatrix(window);
+    const csiMatrix = nodeIds
+      ? extractCsiMatrixNodeAxis(window, nodeIds)
+      : useRawCsi
+        ? extractCsiMatrix(window)
+        : extractFeatureMatrix(window);
 
     // ADR-103: aggregate `n_persons` per window so the cog-person-count
     // training pipeline has count labels. Two summaries:
@@ -529,7 +643,9 @@ function align() {
     paired.push({
       csi: csiMatrix.data,
       csi_shape: csiMatrix.shape,
-      csi_layout: 'time_major',
+      csi_layout: nodeIds ? 'time_node_major' : 'time_major',
+      ...(nodeIds ? { node_ids: nodeIds } : {}),
+      ...(csiMatrix.phase ? { csi_phase: csiMatrix.phase } : {}),
       kp: keypoints,
       conf: Math.round(avgConfidence * 1000) / 1000,
       n_camera_frames: matched.length,

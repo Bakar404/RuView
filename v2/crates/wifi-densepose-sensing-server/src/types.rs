@@ -158,6 +158,11 @@ pub struct NodeInfo {
     pub rssi_dbm: f64,
     pub position: [f64; 3],
     pub amplitude: Vec<f64>,
+    /// Per-subcarrier CSI phase (radians), paired with `amplitude`.
+    /// `#[serde(default)]` preserves compatibility with amplitude-only
+    /// recordings captured before phase was plumbed through.
+    #[serde(default)]
+    pub phase: Vec<f64>,
     pub subcarrier_count: usize,
 }
 

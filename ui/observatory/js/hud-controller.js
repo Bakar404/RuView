@@ -428,9 +428,24 @@ export class HudController {
     const presEl = document.getElementById('presence-indicator');
     const presLabel = document.getElementById('presence-label');
     if (presEl) {
+      // The background-reference sidecar (scripts/presence_service.py), when
+      // running, is authoritative for presence: it compares the absolute
+      // subcarrier profile against a calibrated empty-room reference and so
+      // still sees a motionless occupant. The server's own flag is derived from
+      // motion (main.rs:2681) and decays a static body into the baseline.
+      const oracle = window.__presenceOracle;
       const ml = cls.motion_level || 'absent';
       presEl.className = 'presence-state';
-      if (ml === 'active') { presEl.classList.add('presence--active'); presLabel.textContent = 'ACTIVE'; }
+      if (oracle && oracle.live && (oracle.status === 'ok' || oracle.status === 'stale')) {
+        if (oracle.present) {
+          presEl.classList.add(ml === 'active' ? 'presence--active' : 'presence--present');
+          presLabel.textContent = ml === 'active' ? 'ACTIVE' : 'PRESENT';
+        } else {
+          presEl.classList.add('presence--absent');
+          presLabel.textContent = 'ABSENT';
+        }
+      }
+      else if (ml === 'active') { presEl.classList.add('presence--active'); presLabel.textContent = 'ACTIVE'; }
       else if (cls.presence) { presEl.classList.add('presence--present'); presLabel.textContent = 'PRESENT'; }
       else { presEl.classList.add('presence--absent'); presLabel.textContent = 'ABSENT'; }
     }

@@ -103,6 +103,24 @@
         <span id="presence-label">ABSENT</span>
       </div>
       <div id="fall-alert" class="fall-alert" style="display:none">FALL DETECTED</div>
+
+      <!-- Background-reference presence (scripts/presence_service.py sidecar).
+           Unlike the server's motion-derived flag, this stays true for a
+           motionless occupant. Hidden until the sidecar is reachable. -->
+      <div id="oracle-block" style="display:none">
+        <div class="panel-header" style="margin-top:12px">
+          Presence Oracle <span id="oracle-status" class="oracle-badge">--</span>
+        </div>
+        <div class="signal-row">
+          <span class="signal-label">Score</span>
+          <span class="signal-value" id="oracle-score">--</span>
+        </div>
+        <div class="vital-bar"><div id="oracle-bar" class="vital-bar-fill"></div></div>
+        <canvas id="oracle-sparkline" width="200" height="40"></canvas>
+        <div id="oracle-nodes" class="oracle-nodes"></div>
+        <div id="oracle-meta" class="oracle-meta"></div>
+        <button id="oracle-calibrate" class="oracle-btn">Calibrate empty room (2 min)</button>
+      </div>
     </div>
 
     <!-- Edge module badges (populated dynamically by HudController) -->

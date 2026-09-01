@@ -313,3 +313,21 @@ v2/crates/wifi-densepose-sensing-server/data/
 # ADR-324: wasm-bindgen output for ruview-offaxis is generated locally
 # (see the crate README); never commit generated artifacts.
 v2/crates/ruview-offaxis/pkg/
+
+# Raw capture archive and training checkpoints. Individual files here exceed
+# GitHub's 100 MB per-file hard limit (a 3.2 GB jsonl, 230 MB safetensors) and
+# are regenerable locally, so they are never tracked.
+data/recordings-archive/
+v2/checkpoints/
+v2/logs/
+# Third-party MMFi research dataset and derivatives. Redistribution is
+# restricted by the dataset's own agreement, and this fork is public, so these
+# are regenerated locally from the original download rather than tracked.
+data/mmfi/
+data/mmfi-v2/
+data/mmfi-single/
+data/mmfi-v2-single/
+data/paired-v2/
+
+# Raw CSI captures recorded in a private home. Kept local by choice.
+data/presence/

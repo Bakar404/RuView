@@ -696,3 +696,19 @@ body {
   #key-hints { display: none; }
   .settings-dialog { width: 95vw; }
 }
+
+/* ---- Presence Oracle panel (background-reference sidecar) ---- */
+.oracle-badge { font-size: 9px; letter-spacing: .08em; padding: 1px 5px;
+  border-radius: 3px; vertical-align: middle; margin-left: 4px; }
+.oracle-badge--ok   { background: rgba(57,217,138,.18); color: #39d98a; }
+.oracle-badge--warn { background: rgba(255,183,77,.18); color: #ffb74d; }
+.oracle-nodes { display: flex; gap: 4px; margin-top: 6px; flex-wrap: wrap; }
+.oracle-node { font-size: 9px; padding: 2px 5px; border-radius: 3px;
+  background: rgba(255,255,255,.06); color: #8fa8bd; }
+.oracle-node--hot { background: rgba(57,217,138,.18); color: #39d98a; }
+.oracle-meta { font-size: 9px; color: #6b8098; margin-top: 5px; line-height: 1.4; }
+.oracle-btn { margin-top: 7px; width: 100%; font-size: 9.5px; letter-spacing: .05em;
+  padding: 5px; cursor: pointer; color: #8fa8bd; border-radius: 3px;
+  background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.12); }
+.oracle-btn:hover { background: rgba(255,255,255,.1); color: #cfe3f5; }
+#oracle-sparkline { display: block; margin-top: 6px; width: 100%; }

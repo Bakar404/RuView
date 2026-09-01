@@ -250,6 +250,22 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
 {
     (void)ctx;
 
+    /* ADR-060: MAC address filtering — drop frames from non-matching sources.
+     * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
+     * be corrupted by wifi_init_sta — same root cause as the node_id clobber).
+     *
+     * MUST run before the rate gate. The gate updates s_last_process_us for
+     * every frame it admits; if foreign frames are admitted first and only
+     * then discarded here, they consume the 20 ms budget and the target AP's
+     * ~10 Hz beacons repeatedly land in the shadow of a just-admitted foreign
+     * frame, driving yield to ~zero. Filtering first costs one 6-byte memcmp
+     * per callback and strictly reduces downstream work. */
+    if (s_filter_mac_set) {
+        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
+            return;  /* Source MAC doesn't match filter — skip frame. */
+        }
+    }
+
     /* Early rate gate: drop excess callbacks to ~50 Hz to prevent
      * SPI flash cache crash in WiFi ISR (wDev_ProcessFiq). */
     int64_t now_us = esp_timer_get_time();
@@ -258,15 +274,6 @@ static void wifi_csi_callback(void *ctx, wifi_csi_info_t *info)
         return;
     }
     s_last_process_us = now_us;
-
-    /* ADR-060: MAC address filtering — drop frames from non-matching sources.
-     * Uses defensively-copied s_filter_mac instead of g_nvs_config (which can
-     * be corrupted by wifi_init_sta — same root cause as the node_id clobber). */
-    if (s_filter_mac_set) {
-        if (memcmp(info->mac, s_filter_mac, 6) != 0) {
-            return;  /* Source MAC doesn't match filter — skip frame. */
-        }
-    }
 
     s_cb_count++;
 

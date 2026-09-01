@@ -19,6 +19,7 @@ import { FigurePool, SKELETON_PAIRS } from './figure-pool.js';
 import { PoseSystem } from './pose-system.js';
 import { ScenarioProps } from './scenario-props.js';
 import { HudController, DEFAULTS, SETTINGS_VERSION, PRESETS, SCENARIO_NAMES } from './hud-controller.js';
+import { PresenceOracle } from './presence-oracle.js';
 
 // ---- Palette ----
 const C = {
@@ -132,6 +133,11 @@ class Observatory {
     this._ws = null;
     this._liveData = null;
     this._autoDetectLive();
+
+    // Background-reference presence sidecar. Silently stays hidden when the
+    // sidecar is not running, so this is safe in demo-only use.
+    this._oracle = new PresenceOracle();
+    this._oracle.start(1000);
 
     // Input
     this._initKeyboard();

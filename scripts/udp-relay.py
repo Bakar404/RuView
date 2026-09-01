@@ -54,14 +54,32 @@ def run_relay(listen_host: str, listen_port: int, forward_host: str,
 
     sources: dict[tuple[str, int], int] = {}
     total = 0
+    dropped = 0
     last_stats = time.monotonic()
 
     try:
         while True:
             data, src = rx.recvfrom(65535)
-            tx.sendto(data, forward_addr)
-            if tap_addr:
-                tx.sendto(data, tap_addr)
+            # On Windows a UDP sendto to a port with no listener makes the OS
+            # deliver ICMP "port unreachable" back to this socket, and the next
+            # call raises ConnectionResetError (WSAECONNRESET) even though the
+            # relay itself is healthy. That happens routinely whenever the
+            # sensing container restarts and port 5006 is briefly closed, and it
+            # used to kill the relay outright, silently starving both the
+            # container and the training tap until someone noticed. Drop the
+            # datagram and keep going instead.
+            try:
+                tx.sendto(data, forward_addr)
+                if tap_addr:
+                    tx.sendto(data, tap_addr)
+            except ConnectionResetError:
+                dropped += 1
+                continue
+            except OSError as exc:
+                dropped += 1
+                if dropped % 500 == 1:
+                    print(f"udp-relay: send failed ({exc}); {dropped} dropped so far")
+                continue
             total += 1
             sources[src] = sources.get(src, 0) + 1
 
@@ -71,10 +89,14 @@ def run_relay(listen_host: str, listen_port: int, forward_host: str,
 
             now = time.monotonic()
             if now - last_stats >= stats_interval:
-                print(f"udp-relay: forwarded {total} pkts from "
-                      f"{len(sources)} sources in last {stats_interval:.0f}s")
+                msg = (f"udp-relay: forwarded {total} pkts from "
+                       f"{len(sources)} sources in last {stats_interval:.0f}s")
+                if dropped:
+                    msg += f" ({dropped} dropped, destination unreachable)"
+                print(msg)
                 sources.clear()
                 total = 0
+                dropped = 0
                 last_stats = now
     except KeyboardInterrupt:
         print("udp-relay: stopping")

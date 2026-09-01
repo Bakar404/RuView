@@ -7,8 +7,16 @@ services:
     # ESP32 CSI must accept LAN UDP; TCP APIs below remain loopback-only.
     # kics-scan ignore-line
     ports:
-      - "127.0.0.1:3000:3000"   # REST API
-      - "127.0.0.1:3001:3001"   # WebSocket
+      # Published on all interfaces so a second laptop on the same network can
+      # open the dashboards. This is a deliberate downgrade from the previous
+      # loopback-only mapping: /ws/sensing streams live sensing frames, so only
+      # do this on a network you control (a phone hotspot or a travel router),
+      # never on open corporate or public WiFi. Restore "127.0.0.1:3000:3000"
+      # after the demo.
+      # kics-scan ignore-line
+      - "3000:3000"   # REST API + dashboards
+      # kics-scan ignore-line
+      - "3001:3001"   # WebSocket
       # ESP32 UDP. On Linux/macOS this works with multiple ESP32 nodes out of
       # the box. On Docker Desktop for Windows, multi-source UDP is collapsed
       # to one source IP at the WSL/Hyper-V boundary, so all-but-one node's
@@ -29,6 +37,11 @@ services:
       - RUVIEW_ALLOW_UNAUTHENTICATED=${RUVIEW_ALLOW_UNAUTHENTICATED:-}
       - RUVIEW_API_TOKEN=${RUVIEW_API_TOKEN:-}
       - RUVIEW_BIND_ADDR=${RUVIEW_BIND_ADDR:-0.0.0.0}
+      # DNS-rebinding defense (host_validation.rs). Loopback names are always
+      # allowed; reaching the dashboards from another laptop by LAN IP or
+      # hostname requires listing that Host header here, otherwise every
+      # request gets 421 Misdirected Request.
+      - SENSING_ALLOWED_HOSTS=${SENSING_ALLOWED_HOSTS:-}
       # CSI_SOURCE controls the data source for the sensing server.
       # Options: auto (default) — probe for ESP32 UDP then host WiFi; **fail
       #                           hard with exit 78 if neither is detected**.
@@ -43,6 +56,17 @@ services:
       #   volumes: ["/path/to/models:/app/models"]
       #   MODELS_DIR=/app/models
       - MODELS_DIR=${MODELS_DIR:-data/models}
+    volumes:
+      # Recordings are written inside the container. Without this bind mount
+      # they live only in the writable layer, so `docker compose down` or any
+      # `docker rm` destroys every capture. Binding the host directory makes
+      # captures durable and directly reachable by the alignment scripts.
+      - ../data/recordings:/app/data/recordings
+      # The dashboards are baked in by `COPY ui/ /app/ui/` (docker/Dockerfile.rust:57),
+      # so editing them on the host otherwise requires a full Rust rebuild to see
+      # any change. Mounting them read-only makes UI work immediately visible
+      # while leaving the image contents authoritative if the mount is removed.
+      - ../ui:/app/ui:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -51,7 +75,12 @@ services:
       resources:
         limits:
           cpus: "2.0"
-          memory: 1G
+          # Startup cost scales with the total size of data/recordings: the
+          # server walks every recording before serving (a 3.2 GB capture drove
+          # a ~3.1 GiB transient spike and an exit-137 OOM under the old 1G
+          # cap). Steady-state RSS is only ~20 MiB. Keep long captures in
+          # data/recordings-archive/ so they are not scanned.
+          memory: 3G
     healthcheck:
       test: ["CMD-SHELL", "kill -0 1"]
       interval: 30s

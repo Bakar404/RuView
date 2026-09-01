@@ -5,7 +5,14 @@
 // that ran it hold a permanently signed-out answer. `activate` deletes every
 // cache whose name is not CACHE_NAME, so bumping is what evicts it from clients
 // already in the field. Bump again if a future change poisons the cache.
-const CACHE_NAME = 'ruview-v2';
+//
+// Bumped to v3: the observatory gained the Presence Oracle panel
+// (ui/observatory/js/presence-oracle.js plus edits to observatory.html,
+// observatory/js/main.js, observatory/js/hud-controller.js and
+// observatory/css/observatory.css). Because STATIC_ASSET below matches
+// .html/.js/.css and those are served cache-first, every already-registered
+// client kept replaying the previous shell and none of the new UI appeared.
+const CACHE_NAME = 'ruview-v4';
 
 // Requests whose response depends on the caller's credentials. These must never
 // be served from the Cache API.

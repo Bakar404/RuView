@@ -383,6 +383,15 @@ struct NodeInfo {
     rssi_dbm: f64,
     position: [f64; 3],
     amplitude: Vec<f64>,
+    /// Per-subcarrier CSI phase (radians) for the same frame as `amplitude`.
+    /// The ESP32 ships full I/Q (`csi_collector.c:241`) and `Esp32Frame`
+    /// already carries `phases`, but until now only amplitude reached the
+    /// wire. Pose estimation needs phase: amplitude alone does not localise
+    /// limbs, which is why amplitude-only captures showed no CSI->pose signal.
+    /// `#[serde(default)]` keeps pre-existing amplitude-only recordings
+    /// loadable — they simply deserialize to an empty vector.
+    #[serde(default)]
+    phase: Vec<f64>,
     subcarrier_count: usize,
     /// ADR-110 iter 23 — cross-board sync snapshot for this node.
     /// `None` when no fresh sync packet has been observed (no mesh peer
@@ -669,6 +678,10 @@ struct BoundingBox {
 /// sign detector so that data from different nodes is never mixed.
 struct NodeState {
     pub(crate) frame_history: VecDeque<Vec<f64>>,
+    /// Per-subcarrier phase history, kept in lockstep with `frame_history`
+    /// so index `i` of both refers to the same CSI frame. Bounded by the same
+    /// `FRAME_HISTORY_CAPACITY` and cleared on the same grid changes.
+    pub(crate) phase_history: VecDeque<Vec<f64>>,
     smoothed_person_score: f64,
     pub(crate) prev_person_count: usize,
     smoothed_motion: f64,
@@ -994,6 +1007,7 @@ impl NodeState {
     pub(crate) fn new() -> Self {
         Self {
             frame_history: VecDeque::new(),
+            phase_history: VecDeque::new(),
             smoothed_person_score: 0.0,
             prev_person_count: 0,
             smoothed_motion: 0.0,
@@ -1055,6 +1069,7 @@ impl NodeState {
             Some((active_n, _)) if grid.0 > active_n => {
                 self.active_grid = Some(grid);
                 self.frame_history.clear();
+                self.phase_history.clear();
                 self.baseline_motion = 0.0;
                 self.baseline_frames = 0;
                 true
@@ -1991,6 +2006,99 @@ mod issue_928_magic_collision_tests {
 }
 
 // ── ESP32 UDP frame parser ───────────────────────────────────────────────────
+
+/// Indices of subcarriers that carry usable energy, for a raw ESP32 CSI frame
+/// of `width` bins.
+///
+/// ESP32 CSI buffers are a sequence of 64-bin blocks: the LLTF block first,
+/// then one HT-LTF block per extra 64 bins (HT40 reports 192 = LLTF + 2). Some
+/// bins in every block are DC/guard nulls that are *always* exactly zero, so
+/// they carry no information, waste feature slots and inflate variance.
+///
+/// Measured against live ESP32-S3 nodes (`scripts/probe_subcarrier_layout.py`,
+/// 300 frames, 3 nodes, identical on all): nulls are bins `0` and `27..=37` in
+/// the LLTF block, and `29..=35` in each HT-LTF block — 26 of 192, leaving 166
+/// usable.
+///
+/// Until 2026-06 the emitter used `.take(56)`, which kept all 12 LLTF nulls
+/// while discarding 122 usable bins (26.5% of the signal retained). Widths that
+/// do not match a known block layout are passed through unmasked rather than
+/// guessed at.
+fn usable_subcarrier_indices(width: usize) -> Vec<usize> {
+    const BLOCK: usize = 64;
+    if width == 0 || width % BLOCK != 0 {
+        return (0..width).collect();
+    }
+    (0..width)
+        .filter(|&i| {
+            let rel = i % BLOCK;
+            if i < BLOCK {
+                // LLTF: DC bin plus the wide guard band.
+                !(rel == 0 || (27..=37).contains(&rel))
+            } else {
+                // HT-LTF blocks use a narrower guard band.
+                !(29..=35).contains(&rel)
+            }
+        })
+        .collect()
+}
+
+/// Apply [`usable_subcarrier_indices`] to one raw per-frame vector.
+fn mask_null_subcarriers(v: &[f64]) -> Vec<f64> {
+    usable_subcarrier_indices(v.len())
+        .into_iter()
+        .map(|i| v[i])
+        .collect()
+}
+
+#[cfg(test)]
+mod subcarrier_mask_tests {
+    use super::{mask_null_subcarriers, usable_subcarrier_indices};
+
+    /// Measured live on 3 ESP32-S3 nodes: HT40 frames are 192 bins with 26
+    /// always-zero nulls, leaving 166 usable.
+    #[test]
+    fn ht40_192_keeps_166_usable_bins() {
+        let idx = usable_subcarrier_indices(192);
+        assert_eq!(idx.len(), 166, "expected 166 usable bins, got {}", idx.len());
+        for dead in [0usize, 27, 32, 37, 93, 96, 99, 157, 160, 163] {
+            assert!(!idx.contains(&dead), "bin {dead} is a null and must be dropped");
+        }
+        for live in [1usize, 26, 38, 56, 63, 92, 100, 156, 164, 191] {
+            assert!(idx.contains(&live), "bin {live} is usable and must be kept");
+        }
+    }
+
+    /// The old `.take(56)` discarded bins 56..=191 outright; the mask must keep
+    /// the usable ones above 56 that used to be thrown away.
+    #[test]
+    fn mask_recovers_bins_the_old_truncation_discarded() {
+        let idx = usable_subcarrier_indices(192);
+        assert_eq!(idx.iter().filter(|&&i| i >= 56).count(), 122);
+    }
+
+    #[test]
+    fn lltf_only_64_keeps_52() {
+        assert_eq!(usable_subcarrier_indices(64).len(), 52);
+    }
+
+    /// Unknown widths must pass through untouched rather than be guessed at.
+    #[test]
+    fn non_block_widths_pass_through() {
+        assert_eq!(usable_subcarrier_indices(0).len(), 0);
+        assert_eq!(usable_subcarrier_indices(56).len(), 56);
+        assert_eq!(usable_subcarrier_indices(114).len(), 114);
+    }
+
+    #[test]
+    fn mask_selects_by_index_and_preserves_order() {
+        let raw: Vec<f64> = (0..192).map(|i| i as f64).collect();
+        let out = mask_null_subcarriers(&raw);
+        assert_eq!(out.len(), 166);
+        assert_eq!(out[0], 1.0, "first kept bin is index 1 (DC dropped)");
+        assert!(out.windows(2).all(|w| w[0] < w[1]), "order must be preserved");
+    }
+}
 
 fn parse_esp32_frame(buf: &[u8]) -> Option<Esp32Frame> {
     if buf.len() < 20 {
@@ -3105,6 +3213,10 @@ async fn windows_wifi_task(state: SharedState, tick_ms: u64) {
                 rssi_dbm: first_rssi,
                 position: [0.0, 0.0, 0.0],
                 amplitude: multi_ap_frame.amplitudes,
+                // Host-WiFi scan path derives amplitude from RSSI; there is no
+                // I/Q behind it. Empty (not zeros) so consumers can tell
+                // "no phase measured" from "phase measured as 0".
+                phase: vec![],
                 subcarrier_count: obs_count,
                 sync: None,  // multi-BSSID scan path — no mesh peer
                 node_inference: None, // single aggregate frame; no per-node split
@@ -3269,6 +3381,8 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
             rssi_dbm,
             position: [0.0, 0.0, 0.0],
             amplitude: vec![signal_pct],
+            // Synthetic RSSI fallback carries no I/Q, hence no phase.
+            phase: vec![],
             subcarrier_count: 1,
             sync: None,  // synthetic-RSSI fallback path — no mesh peer
             node_inference: None, // synthetic fallback; no per-node inference
@@ -6480,6 +6594,8 @@ async fn udp_receiver_task(
                             rssi_dbm: n.rssi_history.back().copied().unwrap_or(0.0),
                             position: [2.0, 0.0, 1.5],
                             amplitude: vec![],
+                            // Vitals-only path suppresses raw CSI, phase included.
+                            phase: vec![],
                             subcarrier_count: 0,
                             // Vitals-only path; still expose the sync snapshot
                             // if the node also speaks ESP-NOW.
@@ -6796,6 +6912,13 @@ async fn udp_receiver_task(
                         ns.frame_history.pop_front();
                     }
 
+                    // Keep phase in lockstep with amplitude so the two stay
+                    // index-aligned for the pose pipeline.
+                    ns.phase_history.push_back(frame.phases.clone());
+                    if ns.phase_history.len() > FRAME_HISTORY_CAPACITY {
+                        ns.phase_history.pop_front();
+                    }
+
                     let sample_rate_hz = 1000.0 / 500.0_f64;
                     let (
                         features,
@@ -6967,7 +7090,15 @@ async fn udp_receiver_task(
                             } else {
                                 n.frame_history
                                     .back()
-                                    .map(|a| a.iter().take(56).cloned().collect())
+                                    .map(|a| mask_null_subcarriers(a))
+                                    .unwrap_or_default()
+                            },
+                            phase: if suppress_raw {
+                                vec![]
+                            } else {
+                                n.phase_history
+                                    .back()
+                                    .map(|p| mask_null_subcarriers(p))
                                     .unwrap_or_default()
                             },
                             subcarrier_count: if suppress_raw {
@@ -7222,6 +7353,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
         s.latest_vitals = vitals.clone();
 
         let frame_amplitudes = frame.amplitudes.clone();
+        let frame_phases = frame.phases.clone();
         let frame_n_sub = frame.n_subcarriers;
 
         // ADR-044 §5.2: feed raw features into rolling-P95 estimators before scoring.
@@ -7251,6 +7383,7 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 rssi_dbm: features.mean_rssi,
                 position: [2.0, 0.0, 1.5],
                 amplitude: frame_amplitudes,
+                phase: frame_phases,
                 subcarrier_count: frame_n_sub as usize,
                 sync: None,  // simulated frame path — no mesh peer
                 node_inference: None, // simulated frame; source is synthetic

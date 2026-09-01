@@ -321,8 +321,18 @@ def main():
                 for coco_idx in range(17):
                     mp_idx = MP_TO_COCO[coco_idx]
                     lm = landmarks[mp_idx]
-                    keypoints.append([round(lm.x, 5), round(lm.y, 5)])
-                    visibilities.append(lm.visibility if lm.visibility else 0.0)
+                    x, y = round(lm.x, 5), round(lm.y, 5)
+                    vis = lm.visibility if lm.visibility else 0.0
+                    # MediaPipe extrapolates landmarks beyond the image bounds
+                    # rather than dropping them. Those coordinates are guesses,
+                    # not observations, so mask them: the Rust trainer reads
+                    # column 2 as the COCO visibility flag (dataset.rs:506-508)
+                    # and excludes v < 0.5 from both the loss (losses.rs:94-104)
+                    # and the PCK metric (metrics_core.rs:85,114).
+                    if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                        vis = 0.0
+                    keypoints.append([x, y, round(float(vis), 4)])
+                    visibilities.append(vis)
 
                 confidence = float(np.mean(visibilities))
                 n_visible = int(sum(1 for v in visibilities if v > 0.5))

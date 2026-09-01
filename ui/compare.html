@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RuView · Camera vs CSI Ground Truth</title>
+<style>
+  :root {
+    --bg: #070b10; --panel: rgba(18,26,36,.82); --border: rgba(120,160,200,.18);
+    --txt: #cfe3f5; --dim: #7c93aa; --green: #39d98a; --red: #ff5c73;
+    --amber: #ffb74d; --cyan: #4dd0e1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--txt);
+    font-family: 'Segoe UI', system-ui, sans-serif; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+    border-bottom: 1px solid var(--border); background: rgba(10,16,24,.9);
+  }
+  h1 { font-size: 14px; margin: 0; letter-spacing: .14em; font-weight: 600; }
+  h1 .pi { color: var(--cyan); }
+  .spacer { flex: 1; }
+  select, button {
+    background: rgba(255,255,255,.06); color: var(--txt);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 6px 10px; font-size: 11px; cursor: pointer;
+  }
+  button:hover { background: rgba(255,255,255,.12); }
+  button.primary { background: rgba(57,217,138,.16); color: var(--green);
+    border-color: rgba(57,217,138,.4); }
+  .pill { font-size: 9.5px; letter-spacing: .08em; padding: 3px 8px;
+    border-radius: 10px; background: rgba(255,255,255,.06); color: var(--dim); }
+  .pill--ok { background: rgba(57,217,138,.16); color: var(--green); }
+  .pill--bad { background: rgba(255,92,115,.16); color: var(--red); }
+
+  main { display: grid; grid-template-columns: 1fr 380px; height: calc(100vh - 47px); }
+  #stage { position: relative; background: #000; overflow: hidden; }
+  #webcam, #overlay { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #webcam { object-fit: contain; }
+  #overlay { pointer-events: none; }
+  #cam-prompt {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; text-align: center;
+  }
+  #cam-prompt p { color: var(--dim); font-size: 12px; max-width: 380px; line-height: 1.6; }
+
+  aside { border-left: 1px solid var(--border); padding: 14px;
+    overflow-y: auto; background: rgba(10,16,24,.6); }
+  .sec { font-size: 9.5px; letter-spacing: .14em; color: var(--dim);
+    margin: 16px 0 8px; text-transform: uppercase; }
+  .sec:first-child { margin-top: 0; }
+
+  .verdict { display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; border-radius: 8px; margin-bottom: 7px;
+    border: 1px solid var(--border); background: var(--panel); }
+  .verdict-name { font-size: 10px; letter-spacing: .07em; }
+  .verdict-sub { font-size: 8.5px; color: var(--dim); margin-top: 3px;
+    font-family: 'Consolas', monospace; }
+  .verdict-state { font-size: 15px; font-weight: 700; letter-spacing: .06em; }
+  .s-present { color: var(--green); }
+  .s-absent  { color: var(--dim); }
+  .s-na      { color: var(--amber); }
+  .verdict--dis { border-color: rgba(255,92,115,.5); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  th { text-align: left; color: var(--dim); font-weight: 500; font-size: 9px;
+    letter-spacing: .06em; padding: 4px 3px; border-bottom: 1px solid var(--border); }
+  td { padding: 5px 3px; border-bottom: 1px solid rgba(120,160,200,.07);
+    font-family: 'Consolas', monospace; }
+  .big { font-size: 14px; font-weight: 700; }
+  #strip { width: 100%; height: 84px; display: block; margin-top: 4px; }
+  .note { font-size: 9px; color: var(--dim); line-height: 1.5; margin-top: 8px; }
+  .legend { display: flex; gap: 10px; font-size: 8.5px; color: var(--dim); margin-top: 5px; }
+  .legend i { width: 8px; height: 8px; border-radius: 2px; display: inline-block;
+    margin-right: 3px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span class="pi">&pi;</span> RUVIEW · GROUND TRUTH COMPARE</h1>
+  <span id="pill-cam" class="pill">CAMERA OFF</span>
+  <span id="pill-ws" class="pill">SERVER --</span>
+  <span id="pill-oracle" class="pill">ORACLE --</span>
+  <div class="spacer"></div>
+  <select id="cam-select" title="Choose your iPhone (Camo) as the source"></select>
+  <button id="btn-mirror">Mirror</button>
+  <button id="btn-reset">Reset stats</button>
+  <button id="btn-start" class="primary">Enable camera</button>
+</header>
+
+<main>
+  <div id="stage">
+    <video id="webcam" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="cam-prompt">
+      <p>Connect your iPhone with Camo, then pick it in the dropdown and enable
+         the camera. Video is the ground truth: it never leaves this machine.</p>
+      <button id="btn-start2" class="primary">Enable camera</button>
+    </div>
+  </div>
+
+  <aside>
+    <div class="sec">Live verdicts</div>
+
+    <div class="verdict" id="v-cam">
+      <div>
+        <div class="verdict-name">CAMERA</div>
+        <div class="verdict-sub" id="cam-sub">ground truth · pose landmarker</div>
+      </div>
+      <div class="verdict-state s-na" id="cam-state">--</div>
+    </div>
+
+    <div class="verdict" id="v-ship">
+      <div>
+        <div class="verdict-name">SHIPPED DETECTOR</div>
+        <div class="verdict-sub">motion_score &gt; 0.04 · main.rs:2681</div>
+      </div>
+      <div class="verdict-state s-na" id="ship-state">--</div>
+    </div>
+
+    <div class="verdict" id="v-orac">
+      <div>
+        <div class="verdict-name">BACKGROUND REFERENCE</div>
+        <div class="verdict-sub" id="orac-sub">empty-room profile deviation</div>
+      </div>
+      <div class="verdict-state s-na" id="orac-state">--</div>
+    </div>
+
+    <div class="sec">Agreement with camera</div>
+    <table>
+      <thead>
+        <tr><th>Detector</th><th>All frames</th><th>While STILL</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Shipped</td>
+            <td class="big" id="ag-ship">--</td>
+            <td class="big" id="ag-ship-still">--</td></tr>
+        <tr><td>Background ref</td>
+            <td class="big" id="ag-orac">--</td>
+            <td class="big" id="ag-orac-still">--</td></tr>
+      </tbody>
+    </table>
+    <div class="note" id="miss-note"></div>
+
+    <div class="sec">Timeline (last 90 s)</div>
+    <canvas id="strip" width="352" height="84"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--green)"></i>present</span>
+      <span><i style="background:#22303f"></i>absent</span>
+      <span><i style="background:var(--red)"></i>disagrees with camera</span>
+    </div>
+
+    <div class="note">
+      Rows top to bottom: camera, shipped detector, background reference.
+      &ldquo;STILL&rdquo; means the camera sees you but your landmarks are barely
+      moving &mdash; the regime where a motion-derived detector is expected to
+      fail. All three verdicts are computed independently and none of them can
+      see the others.
+    </div>
+  </aside>
+</main>
+
+<script type="module" src="compare/js/main.js"></script>
+</body>
+</html>
